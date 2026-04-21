@@ -1,10 +1,13 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote } from "./mockData";
 
-const PROXIES = [
-  (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
-  (url) => `https://corsproxy.io/?${encodeURIComponent(url)}`,
-];
+// Finnhub endpoints — browser-friendly, no CORS issues
+const FH_QUOTE = (sym, key) => `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`;
+const FH_CANDLE = (sym, key) => {
+  const to = Math.floor(Date.now() / 1000);
+  const from = to - 5 * 24 * 60 * 60;
+  return `https://finnhub.io/api/v1/stock/candle?symbol=${sym}&resolution=5&from=${from}&to=${to}&token=${key}`;
+};
 
 const WATCHLIST = ["SPY","QQQ","AAPL","NVDA","TSLA","AMD","MSFT","META","UAL","CCL","XOM","GLD"];
 
@@ -66,48 +69,38 @@ function calcBB(closes, period = 20, mult = 2) {
   return { pos:(price-lower)/(upper-lower), upper, lower, mean };
 }
 
-async function fetchWithFallback(symbol) {
-  const yfUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=5m&range=5d`;
-  // Vite dev proxy (no CORS in dev mode)
+async function fetchQuote(symbol, finnhubKey) {
+  if (!finnhubKey) return generateMockQuote(symbol);
   try {
-    const path = `/yf/v8/finance/chart/${symbol}?interval=5m&range=5d`;
-    const r = await fetch(path, { signal: AbortSignal.timeout(5000) });
-    if (r.ok) return JSON.parse(await r.text());
-  } catch {}
-  // CORS proxy fallback
-  for (const proxy of PROXIES) {
-    try {
-      const r = await fetch(proxy(yfUrl), { signal: AbortSignal.timeout(8000) });
-      if (!r.ok) continue;
-      return JSON.parse(await r.text());
-    } catch {}
-  }
-  return null;
-}
+    const [quoteRes, candleRes] = await Promise.all([
+      fetch(FH_QUOTE(symbol, finnhubKey), { signal: AbortSignal.timeout(8000) }),
+      fetch(FH_CANDLE(symbol, finnhubKey), { signal: AbortSignal.timeout(8000) }),
+    ]);
+    if (!quoteRes.ok) return generateMockQuote(symbol);
+    const quote = await quoteRes.json();
+    const candle = candleRes.ok ? await candleRes.json() : null;
 
-async function fetchQuote(symbol) {
-  try {
-    const data = await fetchWithFallback(symbol);
-    const result = data?.chart?.result?.[0];
-    if (!result) return generateMockQuote(symbol);
-    const meta = result.meta;
-    const q = result.indicators.quote[0];
-    const closes = (q.close||[]).filter(v=>v!=null);
-    const highs = (q.high||[]).filter(v=>v!=null);
-    const lows = (q.low||[]).filter(v=>v!=null);
-    const volumes = (q.volume||[]).filter(v=>v!=null);
-    const price = meta.regularMarketPrice ?? closes[closes.length-1];
-    const prevClose = meta.chartPreviousClose ?? meta.previousClose;
+    const price = quote.c;
+    const prevClose = quote.pc;
+    if (!price || !prevClose) return generateMockQuote(symbol);
+
     const change = price - prevClose;
-    const changePct = (change/prevClose)*100;
-    const avgVol = volumes.slice(-20).reduce((a,b)=>a+b,0)/20;
-    const curVol = volumes[volumes.length-1]||0;
+    const changePct = (change / prevClose) * 100;
+
+    const closes = candle?.s === "ok" ? candle.c : [];
+    const highs  = candle?.s === "ok" ? candle.h : [];
+    const lows   = candle?.s === "ok" ? candle.l : [];
+    const volumes= candle?.s === "ok" ? candle.v : [];
+
+    const avgVol = volumes.length > 1 ? volumes.slice(-20).reduce((a,b)=>a+b,0)/Math.min(20,volumes.length) : 0;
+    const curVol = volumes[volumes.length-1] || 0;
     const recent5 = closes.slice(-5);
+
     return {
       symbol, price, change, changePct, prevClose,
-      high52: meta.fiftyTwoWeekHigh, low52: meta.fiftyTwoWeekLow,
-      dayHigh: meta.regularMarketDayHigh, dayLow: meta.regularMarketDayLow,
-      volume: meta.regularMarketVolume||curVol,
+      high52: quote.h, low52: quote.l,
+      dayHigh: quote.h, dayLow: quote.l,
+      volume: curVol,
       rsi: calcRSI(closes), macd: calcMACD(closes),
       ema9: calcEMA(closes,9), ema20: calcEMA(closes,20), ema50: calcEMA(closes,50),
       atr: calcATR(highs,lows,closes),
@@ -116,7 +109,7 @@ async function fetchQuote(symbol) {
       bb: calcBB(closes),
       momentum5: recent5.length===5 ? ((recent5[4]-recent5[0])/recent5[0])*100 : null,
       sparkline: closes.slice(-30), closes, highs, lows, volumes,
-      marketState: meta.marketState, lastFetched: Date.now(), isMock: false,
+      marketState: "LIVE", lastFetched: Date.now(), isMock: false,
     };
   } catch {
     return generateMockQuote(symbol);
@@ -148,31 +141,42 @@ function RSIBar({ rsi }) {
 }
 
 function ApiKeyModal({ onSave }) {
-  const [key, setKey] = useState(()=>localStorage.getItem("anthropic_key")||"");
-  const valid = key.startsWith("sk-");
+  const [ak, setAk] = useState(()=>localStorage.getItem("anthropic_key")||"");
+  const [fk, setFk] = useState(()=>localStorage.getItem("finnhub_key")||"");
+  const valid = ak.startsWith("sk-") && fk.length > 5;
+  function save() {
+    if (!valid) return;
+    localStorage.setItem("anthropic_key", ak);
+    localStorage.setItem("finnhub_key", fk);
+    onSave(ak, fk);
+  }
   return (
     <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.88)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:999}}>
-      <div style={{background:"#0F0F0F",border:"1px solid #C9A84C",padding:28,width:380}}>
-        <div style={{fontSize:14,fontWeight:900,color:"#C9A84C",letterSpacing:3,marginBottom:8}}>◈ API KEY REQUIRED</div>
+      <div style={{background:"#0F0F0F",border:"1px solid #C9A84C",padding:28,width:400}}>
+        <div style={{fontSize:14,fontWeight:900,color:"#C9A84C",letterSpacing:3,marginBottom:8}}>◈ API KEYS REQUIRED</div>
         <div style={{fontSize:10,color:"#666",marginBottom:16,lineHeight:1.7}}>
-          Enter your Anthropic API key to enable AI analysis.<br/>Stored locally in your browser only.
+          Both keys are stored locally in your browser only.
         </div>
-        <input
-          value={key} onChange={e=>setKey(e.target.value)}
-          onKeyDown={e=>e.key==="Enter"&&valid&&(localStorage.setItem("anthropic_key",key),onSave(key))}
-          placeholder="sk-ant-..."
+        <div style={{fontSize:9,color:"#C9A84C",letterSpacing:2,marginBottom:4}}>ANTHROPIC KEY (AI analysis)</div>
+        <input value={ak} onChange={e=>setAk(e.target.value)} placeholder="sk-ant-..."
           style={{width:"100%",boxSizing:"border-box",background:"#080808",border:"1px solid #2A2A2A",
             color:"#D8D0C0",fontFamily:"'Courier New',monospace",fontSize:12,padding:"9px 12px",
-            outline:"none",marginBottom:12}}
-        />
-        <button
-          onClick={()=>{if(valid){localStorage.setItem("anthropic_key",key);onSave(key);}}}
-          disabled={!valid}
+            outline:"none",marginBottom:14}}/>
+        <div style={{fontSize:9,color:"#C9A84C",letterSpacing:2,marginBottom:4}}>FINNHUB KEY (live prices)</div>
+        <input value={fk} onChange={e=>setFk(e.target.value)} placeholder="your finnhub key..."
+          onKeyDown={e=>e.key==="Enter"&&save()}
+          style={{width:"100%",boxSizing:"border-box",background:"#080808",border:"1px solid #2A2A2A",
+            color:"#D8D0C0",fontFamily:"'Courier New',monospace",fontSize:12,padding:"9px 12px",
+            outline:"none",marginBottom:14}}/>
+        <button onClick={save} disabled={!valid}
           style={{width:"100%",background:valid?"#C9A84C":"#1A1A1A",color:valid?"#000":"#444",
             border:"none",fontFamily:"'Courier New',monospace",fontWeight:900,fontSize:11,
-            letterSpacing:2,padding:10,cursor:valid?"pointer":"not-allowed"}}
-        >SAVE &amp; CONNECT</button>
-        <div style={{fontSize:9,color:"#444",marginTop:10}}>Get a key at console.anthropic.com · Not financial advice.</div>
+            letterSpacing:2,padding:10,cursor:valid?"pointer":"not-allowed"}}>
+          SAVE &amp; CONNECT
+        </button>
+        <div style={{fontSize:9,color:"#444",marginTop:10,lineHeight:1.6}}>
+          Anthropic: console.anthropic.com · Finnhub: finnhub.io · Not financial advice.
+        </div>
       </div>
     </div>
   );
@@ -213,11 +217,12 @@ export default function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [tab, setTab] = useState("chat");
   const [apiKey, setApiKey] = useState(()=>localStorage.getItem("anthropic_key")||"");
+  const [finnhubKey, setFinnhubKey] = useState(()=>localStorage.getItem("finnhub_key")||"");
   const chatRef = useRef(null);
 
   const refreshAll = useCallback(async (silent=false) => {
     if (!silent) setRefreshing(true);
-    const results = await Promise.all(WATCHLIST.map(fetchQuote));
+    const results = await Promise.all(WATCHLIST.map(s=>fetchQuote(s, finnhubKey)));
     const map = {};
     results.forEach((r,i)=>{ if(r) map[WATCHLIST[i]]=r; });
     setQuotes(prev=>({...prev,...map}));
@@ -282,7 +287,7 @@ export default function App() {
   const loadedCount = Object.keys(quotes).length;
   const mockCount = Object.values(quotes).filter(q=>q.isMock).length;
 
-  if (!apiKey) return <ApiKeyModal onSave={k=>setApiKey(k)}/>;
+  if (!apiKey||!finnhubKey) return <ApiKeyModal onSave={(ak,fk)=>{setApiKey(ak);setFinnhubKey(fk);}}/>;
 
   return (
     <div style={{display:"flex",flexDirection:"column",height:"100vh",background:"#080808",
