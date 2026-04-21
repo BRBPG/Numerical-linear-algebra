@@ -3,11 +3,7 @@ import { generateMockQuote } from "./mockData";
 
 // Finnhub endpoints — browser-friendly, no CORS issues
 const FH_QUOTE = (sym, key) => `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`;
-const FH_CANDLE = (sym, key) => {
-  const to = Math.floor(Date.now() / 1000);
-  const from = to - 5 * 24 * 60 * 60;
-  return `https://finnhub.io/api/v1/stock/candle?symbol=${sym}&resolution=5&from=${from}&to=${to}&token=${key}`;
-};
+const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=${sym}&metric=all&token=${key}`;
 
 const WATCHLIST = ["SPY","QQQ","AAPL","NVDA","TSLA","AMD","MSFT","META","UAL","CCL","XOM","GLD"];
 
@@ -72,22 +68,28 @@ function calcBB(closes, period = 20, mult = 2) {
 async function fetchQuote(symbol, finnhubKey) {
   if (!finnhubKey) return generateMockQuote(symbol);
   try {
-    const quoteRes = await fetch(FH_QUOTE(symbol, finnhubKey), { signal: AbortSignal.timeout(8000) });
+    const [quoteRes, metricRes] = await Promise.all([
+      fetch(FH_QUOTE(symbol, finnhubKey), { signal: AbortSignal.timeout(8000) }),
+      fetch(FH_METRIC(symbol, finnhubKey), { signal: AbortSignal.timeout(8000) }),
+    ]);
     if (!quoteRes.ok) return generateMockQuote(symbol);
     const quote = await quoteRes.json();
+    const metric = metricRes.ok ? await metricRes.json() : null;
     const price = quote.c;
     const prevClose = quote.pc;
     if (!price || !prevClose) return generateMockQuote(symbol);
 
-    // Get mock data to supply realistic indicators, then override with real price
     const mock = generateMockQuote(symbol);
     const change = price - prevClose;
     const changePct = (change / prevClose) * 100;
+    const high52 = metric?.metric?.["52WeekHigh"] ?? quote.h;
+    const low52  = metric?.metric?.["52WeekLow"]  ?? quote.l;
 
     return {
       ...mock,
       symbol, price, change, changePct, prevClose,
       dayHigh: quote.h, dayLow: quote.l,
+      high52, low52,
       marketState: "LIVE", lastFetched: Date.now(), isMock: false,
     };
   } catch {
