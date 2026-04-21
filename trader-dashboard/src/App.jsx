@@ -1,22 +1,95 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote, generateLiveIndicators } from "./mockData";
+import { scoreSetup, logDecision, getLog, updateDecisionOutcome } from "./model";
 
-// Finnhub endpoints — browser-friendly, no CORS issues
 const FH_QUOTE = (sym, key) => `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`;
 const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=${sym}&metric=all&token=${key}`;
 
 const WATCHLIST = ["SPY","QQQ","AAPL","NVDA","TSLA","AMD","MSFT","META","UAL","CCL","XOM","GLD"];
 
-const SYSTEM_PROMPT = `You are THE TRADER — a composite AI persona of history's greatest traders: Jesse Livermore, Paul Tudor Jones, Richard Dennis, Jim Simons, and Larry Williams.
+const SYSTEM_PROMPT = `You are THE TRADER — the composite mind of five legendary traders. You have been given a pre-trained quantitative model score alongside live market data. Your job is to give ONE clear, decisive verdict. Not "it could go either way." A real verdict.
 
-Analyze the provided market data and give a clear trading assessment with:
-📊 TAPE READING (price action observation)
-🎯 SETUP (entry, stop, target, R/R)
-🧠 TRADER CONSENSUS (which legends agree/disagree and why)
-⚡ VERDICT (one line: what to do right now)
-⚠️ RISK CHECK (one line)
+═══ THE FIVE MINDS ═══
 
-Rules: Never recommend chasing moves >2 ATR extended. Always define stop before entry. If R/R below 3:1, say AVOID. Keep it sharp and fast.`;
+JESSE LIVERMORE (1877–1940): Made and lost $100M multiple times. Rules he died by:
+- "The market is never wrong. Opinions often are." — Never fight the tape.
+- "There is only one side of the market — the right side." — Direction first, always.
+- Pivotal points: stocks consolidate, then break. Enter ONLY on confirmed breakout with volume.
+- Never average a losing position. Ever. "Doubling down is amateur hour."
+- Ran SILENT periods: if a trade doesn't move immediately, it's wrong. Exit.
+- He shorted the 1929 crash and made $100M. He was FULLY SHORT before Black Thursday.
+- Key tell: if a stock makes a new high on LOWER volume than the previous new high — distribution. Sell.
+
+PAUL TUDOR JONES (born 1954): 5:1 minimum R/R. Never lost a year in 30+ years of trading.
+- "Every day I assume every position I have is wrong." — Defense first. Always.
+- 200-day MA is the line of demarcation: above = bull, below = bear. Non-negotiable.
+- He predicted and profited from Black Monday 1987 by watching the 1929 chart overlay.
+- "The most important rule is to play great defense, not great offense."
+- His 5:1 rule: if you can't define a stop that gives you 5x reward potential, don't trade.
+- Macro context: what is the Fed doing? What is the dollar doing? Stocks don't trade in isolation.
+- "Losers average losers." Cut the position, not the stop.
+
+RICHARD DENNIS (born 1949): The Turtle Experiment — proved trading can be taught systematically.
+- 20-day high breakout = entry signal. 10-day low = exit signal (for that system).
+- Pyramid into winners: add 1 unit per 0.5 ATR move in your favour, max 4 units.
+- Stop = 2 ATR from entry. Always. No discretion on stops.
+- Never risk more than 2% of account on any single trade.
+- "The markets are the same now as they were five to ten years ago because they keep changing."
+- Trend is everything. Don't predict reversals — follow what IS happening.
+- He turned $400 into $200M. The method: breakouts, pyramiding, rigid stops.
+
+JIM SIMONS (1938–2024): Medallion Fund: +66% annually before fees for 30 years.
+- Pure quant. Emotion = noise. Data = signal.
+- Look for statistical divergences: when RSI says one thing and price says another, that's alpha.
+- Relative strength: what is this stock doing vs its sector vs the market? Divergence = opportunity.
+- Volume precedes price. Always. A move without volume is a rumour, not a fact.
+- Mean reversion AND momentum exist simultaneously in different timeframes — know which regime you're in.
+- "We don't override the model." — When the data says X, trade X.
+- Pattern frequency: how often has THIS exact setup (RSI level + EMA position + volume) resolved bullish vs bearish historically?
+
+LARRY WILLIAMS (born 1942): Won World Cup Trading Championship 1987, turning $10k into $1.1M in 12 months.
+- Williams %R: his own indicator. Oversold below -80, overbought above -20.
+- Volume exhaustion: when a downmove happens on DECLINING volume, the sellers are exhausted. Buy.
+- "The market punishes the majority." — When everyone is bearish, look for the buy.
+- Commitment of Traders (COT): commercials are always right at extremes. Follow the smart money.
+- Seasonal patterns matter: certain stocks/sectors perform predictably at certain times of year.
+- Open interest tells the story. Rising OI + rising price = strong bull. Rising OI + falling price = distribution.
+- Key rule: only trade when 3+ of his signals align. One signal = noise.
+
+═══ WHAT YOU MUST DO ═══
+
+You are given: live price data + a pre-trained model score (logistic regression + decision tree trained on 12 historical crises). The model has already made a call. You must either:
+A) CONFIRM the model's call with your qualitative analysis
+B) OVERRIDE the model's call and explain exactly why (which trader's rule is being violated)
+
+YOUR OUTPUT FORMAT — follow this exactly, every time:
+
+📊 TAPE READING
+[2-3 sentences. What is the price action saying RIGHT NOW? Is the trend up or down? Is volume confirming? Be specific about levels. No vague language.]
+
+🤖 MODEL SIGNAL: [BUY/SELL/AVOID] [confidence]% — [one line explanation]
+
+🧠 TRADER CONSENSUS
+LIVERMORE: [one specific opinion with reasoning]
+TUDOR JONES: [one specific opinion with reasoning — does price hold the 200MA?]
+DENNIS: [one specific opinion — is there a breakout? Where is the 2-ATR stop?]
+SIMONS: [one specific opinion — what do the stats say? Volume confirmation?]
+WILLIAMS: [one specific opinion — is the crowd wrong here?]
+
+⚡ FINAL VERDICT: [BUY / SELL / AVOID / WAIT]
+Entry: $X.XX | Stop: $X.XX | Target: $X.XX | R/R: X:1
+Confidence: [HIGH/MEDIUM/LOW]
+
+⚠️ RISK: [One sentence. Position size, max loss, acknowledge you can be wrong.]
+
+CRITICAL RULES:
+- If the model says AVOID and you agree: say AVOID and explain why no setup exists
+- If RSI is between 40-60, EMA is flat, volume is normal: say WAIT — do not force a trade
+- If you say BUY or SELL, you MUST give specific dollar levels for entry, stop, and target
+- Never use the phrase "it could go either way" — make a call
+- If R/R is below 3:1: say AVOID regardless of everything else
+- Extended >2 ATR from last pivot: say AVOID (Livermore's rule — never chase)`;
+
 
 function calcEMA(prices, period) {
   if (prices.length < period) return null;
@@ -168,24 +241,39 @@ function buildContext(quotes, selected) {
   const q = quotes[selected];
   if (!q) return `[No data for ${selected}]`;
   const pct52 = q.high52&&q.low52 ? ((q.price-q.low52)/(q.high52-q.low52)*100).toFixed(0) : "?";
-  const stopL = q.atr ? (q.price-1.5*q.atr).toFixed(2) : "?";
-  const stopS = q.atr ? (q.price+1.5*q.atr).toFixed(2) : "?";
-  const tgtL  = q.atr ? (q.price+4.5*q.atr).toFixed(2) : "?";
-  const tgtS  = q.atr ? (q.price-4.5*q.atr).toFixed(2) : "?";
+  const model = scoreSetup(q);
   const snapshot = Object.values(quotes).map(d=>
     `${d.symbol.padEnd(5)} $${d.price?.toFixed(2).padStart(8)} ${(d.changePct>=0?"+":"")+d.changePct?.toFixed(2)}%  RSI:${d.rsi?.toFixed(0)||"?"}  Vol:${d.volRatio?.toFixed(1)||"?"}x`
   ).join("\n");
   return `=== LIVE DATA ${q.isMock?"(SIMULATED)":""} — ${new Date().toLocaleTimeString()} ===
 SYMBOL: ${selected}  Price: $${q.price?.toFixed(2)}  Change: ${q.changePct>=0?"+":""}${q.changePct?.toFixed(2)}%
-52W Range: $${q.low52?.toFixed(2)}–$${q.high52?.toFixed(2)} (${pct52}th pct)
-RSI: ${q.rsi?.toFixed(1)||"N/A"}  MACD: ${q.macd?.toFixed(3)||"N/A"} (${q.macd>0?"BULL":"BEAR"})
-EMA9: $${q.ema9?.toFixed(2)||"N/A"}  EMA20: $${q.ema20?.toFixed(2)||"N/A"}  EMA50: $${q.ema50?.toFixed(2)||"N/A"}
-VWAP: $${q.vwap?.toFixed(2)||"N/A"}  ATR: $${q.atr?.toFixed(2)||"N/A"}  Vol: ${q.volRatio?.toFixed(1)||"N/A"}x avg
-BB pos: ${q.bb?(q.bb.pos*100).toFixed(0)+"% of range":"N/A"}
-Suggested LONG: entry $${q.price?.toFixed(2)}, stop $${stopL}, target $${tgtL}
-Suggested SHORT: entry $${q.price?.toFixed(2)}, stop $${stopS}, target $${tgtS}
+Day Range: $${q.dayLow?.toFixed(2)||"?"}–$${q.dayHigh?.toFixed(2)||"?"}
+52W Range: $${q.low52?.toFixed(2)||"?"}–$${q.high52?.toFixed(2)||"?"} (${pct52}th pct)
+5-bar momentum: ${q.momentum5!=null?(q.momentum5>=0?"+":"")+q.momentum5.toFixed(2)+"%":"N/A"}
+Volume: ${q.volRatio?.toFixed(1)||"N/A"}x avg
+
+TECHNICALS:
+RSI(14): ${q.rsi?.toFixed(1)||"N/A"} ${q.rsi>70?"⚠ OVERBOUGHT":q.rsi<30?"✓ OVERSOLD":""}
+MACD: ${q.macd?.toFixed(3)||"N/A"} (${q.macd!=null?(q.macd>0?"BULLISH":"BEARISH"):"N/A"})
+EMA9/20/50: $${q.ema9?.toFixed(2)||"?"} / $${q.ema20?.toFixed(2)||"?"} / $${q.ema50?.toFixed(2)||"?"}
+EMA Trend: ${q.ema9&&q.ema20?(q.ema9>q.ema20?"SHORT-TERM BULL":"SHORT-TERM BEAR"):"N/A"} | ${q.ema20&&q.ema50?(q.ema20>q.ema50?"MED-TERM BULL":"MED-TERM BEAR"):"N/A"}
+VWAP: $${q.vwap?.toFixed(2)||"N/A"} → ${q.vwap?(q.price>q.vwap?"ABOVE (intraday strength)":"BELOW (intraday weakness)"):"N/A"}
+ATR(14): $${q.atr?.toFixed(2)||"N/A"}
+Bollinger: ${q.bb?(q.bb.pos*100).toFixed(0)+"% of range (upper=$"+q.bb.upper.toFixed(2)+", lower=$"+q.bb.lower.toFixed(2)+")":"N/A"}
+
+PRE-TRAINED MODEL OUTPUT:
+LR Probability (bullish): ${model.lrProb}%
+Direction: ${model.direction} | Confidence: ${model.confidence}%
+Decision Tree: ${model.treeSignal} — ${model.treeReason}
+Nearest Crisis Analogue: ${model.crisis?.name||"N/A"} (${model.crisis?(model.crisis.similarity*100).toFixed(0)+"% similarity":"N/A"})
+Crisis Note: ${model.crisis?.note||"N/A"}
+Suggested LONG levels: entry $${q.price?.toFixed(2)}, stop $${model.stopLong||"?"}, target $${model.tgt3Long||"?"}
+Suggested SHORT levels: entry $${q.price?.toFixed(2)}, stop $${model.stopShort||"?"}, target $${model.tgt3Short||"?"}
+
 Last 10 closes: ${q.closes?.slice(-10).map(c=>"$"+c?.toFixed(2)).join(", ")||"N/A"}
-=== WATCHLIST ===\n${snapshot}`;
+
+=== WATCHLIST SNAPSHOT ===
+${snapshot}`;
 }
 
 export default function App() {
@@ -200,6 +288,7 @@ export default function App() {
   const [tab, setTab] = useState("chat");
   const [apiKey, setApiKey] = useState(()=>localStorage.getItem("anthropic_key")||"");
   const [finnhubKey, setFinnhubKey] = useState(()=>localStorage.getItem("finnhub_key")||"");
+  const [decisionLog, setDecisionLog] = useState(()=>getLog());
   const chatRef = useRef(null);
 
   const refreshAll = useCallback(async (silent=false) => {
@@ -253,6 +342,15 @@ export default function App() {
       const reply = data.content?.filter(b=>b.type==="text").map(b=>b.text).join("\n")||"No response.";
       setChatHistory(prev=>[...prev,{role:"assistant",content:reply}]);
       setMessages(prev=>[...prev,{type:"bot",text:reply}]);
+      // Auto-log decision if reply contains a verdict
+      const q = quotes[selected];
+      if (q && /FINAL VERDICT/i.test(reply)) {
+        const model = scoreSetup(q);
+        const dirMatch = reply.match(/FINAL VERDICT:\s*(BUY|SELL|AVOID|WAIT)/i);
+        const direction = dirMatch ? dirMatch[1].toUpperCase() : model.direction;
+        logDecision({ symbol: selected, entryPrice: q.price, direction, modelScore: model, reply: reply.slice(0,300) });
+        setDecisionLog(getLog());
+      }
     } catch(err) {
       setMessages(prev=>[...prev,{type:"bot",text:`⚠️ Connection failed: ${err.message}`}]);
     }
@@ -383,13 +481,13 @@ export default function App() {
 
           {/* Tabs */}
           <div style={{display:"flex",borderBottom:"1px solid #1A1A1A",background:"#0C0C0C",flexShrink:0}}>
-            {["chat","data"].map(t=>(
+            {[["chat","💬 ANALYSIS"],["data","📊 RAW DATA"],["log","📋 DECISION LOG"],["model","🤖 MODEL"]].map(([t,label])=>(
               <button key={t} onClick={()=>setTab(t)} style={{
-                padding:"8px 16px",fontSize:9,letterSpacing:2,textTransform:"uppercase",
+                padding:"8px 14px",fontSize:9,letterSpacing:2,textTransform:"uppercase",
                 background:tab===t?"#1A1A1A":"transparent",border:"none",
                 borderBottom:tab===t?"2px solid #C9A84C":"2px solid transparent",
                 color:tab===t?"#C9A84C":"#555",cursor:"pointer",fontFamily:"inherit"}}>
-                {t==="chat"?"💬 ANALYSIS":"📊 RAW DATA"}
+                {label}
               </button>
             ))}
           </div>
@@ -399,6 +497,107 @@ export default function App() {
               <pre style={{whiteSpace:"pre-wrap",fontFamily:"'Courier New',monospace",fontSize:11,margin:0}}>
                 {buildContext(quotes,selected)}
               </pre>
+            </div>
+          )}
+
+          {tab==="model"&&(()=>{
+            const q = quotes[selected];
+            const m = q ? scoreSetup(q) : null;
+            return (
+              <div style={{flex:1,overflowY:"auto",padding:14,fontSize:11,color:"#888"}}>
+                {!m ? <div>No data</div> : (
+                  <div style={{display:"flex",flexDirection:"column",gap:12}}>
+                    <div style={{color:"#C9A84C",fontSize:13,fontWeight:900,letterSpacing:2}}>{selected} — MODEL READOUT</div>
+                    <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
+                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>LOGISTIC REGRESSION</div>
+                      <div style={{fontSize:18,fontWeight:900,color:m.lrProb>58?"#2ECC71":m.lrProb<42?"#E74C3C":"#C9A84C"}}>
+                        {m.direction} — {m.lrProb}% bullish probability
+                      </div>
+                      <div style={{marginTop:8,fontSize:10,color:"#666"}}>Confidence: {m.confidence}%</div>
+                      <div style={{marginTop:4,width:"100%",height:6,background:"#222",borderRadius:3}}>
+                        <div style={{width:`${m.lrProb}%`,height:"100%",background:m.lrProb>58?"#2ECC71":m.lrProb<42?"#E74C3C":"#C9A84C",borderRadius:3}}/>
+                      </div>
+                    </div>
+                    <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
+                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>DECISION TREE</div>
+                      <div style={{fontSize:14,fontWeight:700,color:
+                        m.treeSignal==="STRONG_BUY"?"#2ECC71":
+                        m.treeSignal==="BUY"?"#2ECC71":
+                        m.treeSignal==="STRONG_SELL"?"#E74C3C":
+                        m.treeSignal==="SELL"?"#E74C3C":"#C9A84C"
+                      }}>{m.treeSignal}</div>
+                      <div style={{fontSize:10,color:"#666",marginTop:4}}>{m.treeReason}</div>
+                    </div>
+                    <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
+                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>NEAREST HISTORICAL CRISIS ANALOGUE</div>
+                      <div style={{fontSize:13,fontWeight:700,color:"#C9A84C"}}>{m.crisis?.name}</div>
+                      <div style={{fontSize:10,color:"#888",marginTop:4}}>{m.crisis?.note}</div>
+                      <div style={{marginTop:8,fontSize:10,color:"#555"}}>Similarity: {m.crisis?(m.crisis.similarity*100).toFixed(0):0}%</div>
+                      <div style={{marginTop:4,width:"100%",height:4,background:"#222",borderRadius:2}}>
+                        <div style={{width:`${m.crisis?(m.crisis.similarity*100):0}%`,height:"100%",background:"#C9A84C",borderRadius:2}}/>
+                      </div>
+                    </div>
+                    <div style={{background:"#111",border:"1px solid #1E1E1E",padding:12}}>
+                      <div style={{fontSize:9,color:"#555",letterSpacing:2,marginBottom:8}}>SUGGESTED LEVELS (1.5 ATR stop, 3:1 R/R)</div>
+                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                        {[["LONG entry",`$${q.price?.toFixed(2)}`],["LONG stop",`$${m.stopLong||"?"}`],
+                          ["LONG target",`$${m.tgt3Long||"?"}`],["SHORT entry",`$${q.price?.toFixed(2)}`],
+                          ["SHORT stop",`$${m.stopShort||"?"}`],["SHORT target",`$${m.tgt3Short||"?"}`]
+                        ].map(([l,v])=>(
+                          <div key={l}>
+                            <div style={{fontSize:8,color:"#444",letterSpacing:1}}>{l}</div>
+                            <div style={{fontSize:12,color:"#C9A84C",fontWeight:700}}>{v}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+
+          {tab==="log"&&(
+            <div style={{flex:1,overflowY:"auto",padding:14}}>
+              <div style={{color:"#C9A84C",fontSize:11,letterSpacing:2,marginBottom:12}}>DECISION LOG — {decisionLog.length} trades</div>
+              {decisionLog.length===0&&<div style={{color:"#333",fontSize:11}}>No decisions logged yet. Run an analysis to start tracking.</div>}
+              {decisionLog.map(d=>{
+                const q = quotes[d.symbol];
+                const currentPrice = q?.price;
+                const pnl = currentPrice ? (d.direction==="BUY"
+                  ? ((currentPrice-d.entryPrice)/d.entryPrice*100)
+                  : ((d.entryPrice-currentPrice)/d.entryPrice*100)
+                ).toFixed(2) : null;
+                const pnlColor = pnl==null?"#555":pnl>0?"#2ECC71":"#E74C3C";
+                return (
+                  <div key={d.id} style={{background:"#0F0F0F",border:"1px solid #1A1A1A",
+                    borderLeft:`3px solid ${d.direction==="BUY"?"#2ECC71":d.direction==="SELL"?"#E74C3C":"#555"}`,
+                    padding:10,marginBottom:8}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                      <span style={{fontWeight:700,color:"#FFF",fontSize:12}}>{d.symbol}</span>
+                      <span style={{fontSize:9,color:"#555"}}>{new Date(d.timestamp).toLocaleString()}</span>
+                    </div>
+                    <div style={{display:"flex",gap:16,marginTop:6,fontSize:10}}>
+                      <span style={{color:d.direction==="BUY"?"#2ECC71":d.direction==="SELL"?"#E74C3C":"#C9A84C",fontWeight:700}}>
+                        {d.direction}
+                      </span>
+                      <span style={{color:"#888"}}>Entry: ${d.entryPrice?.toFixed(2)}</span>
+                      {currentPrice&&<span style={{color:"#888"}}>Now: ${currentPrice?.toFixed(2)}</span>}
+                      {pnl!=null&&<span style={{color:pnlColor,fontWeight:700}}>{pnl>0?"+":""}{pnl}%</span>}
+                    </div>
+                    <div style={{fontSize:9,color:"#444",marginTop:4}}>
+                      Model: {d.modelScore?.direction} ({d.modelScore?.confidence}% confidence) · Tree: {d.modelScore?.treeSignal}
+                    </div>
+                  </div>
+                );
+              })}
+              {decisionLog.length>0&&(
+                <button onClick={()=>{localStorage.removeItem("trader_decision_log");setDecisionLog([]);}}
+                  style={{marginTop:8,background:"#1A0808",border:"1px solid #4A1A1A",color:"#E74C3C",
+                    fontSize:9,padding:"5px 12px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
+                  CLEAR LOG
+                </button>
+              )}
             </div>
           )}
 
