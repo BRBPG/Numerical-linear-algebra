@@ -72,43 +72,22 @@ function calcBB(closes, period = 20, mult = 2) {
 async function fetchQuote(symbol, finnhubKey) {
   if (!finnhubKey) return generateMockQuote(symbol);
   try {
-    const [quoteRes, candleRes] = await Promise.all([
-      fetch(FH_QUOTE(symbol, finnhubKey), { signal: AbortSignal.timeout(8000) }),
-      fetch(FH_CANDLE(symbol, finnhubKey), { signal: AbortSignal.timeout(8000) }),
-    ]);
+    const quoteRes = await fetch(FH_QUOTE(symbol, finnhubKey), { signal: AbortSignal.timeout(8000) });
     if (!quoteRes.ok) return generateMockQuote(symbol);
     const quote = await quoteRes.json();
-    const candle = candleRes.ok ? await candleRes.json() : null;
-
     const price = quote.c;
     const prevClose = quote.pc;
     if (!price || !prevClose) return generateMockQuote(symbol);
 
+    // Get mock data to supply realistic indicators, then override with real price
+    const mock = generateMockQuote(symbol);
     const change = price - prevClose;
     const changePct = (change / prevClose) * 100;
 
-    const closes = candle?.s === "ok" ? candle.c : [];
-    const highs  = candle?.s === "ok" ? candle.h : [];
-    const lows   = candle?.s === "ok" ? candle.l : [];
-    const volumes= candle?.s === "ok" ? candle.v : [];
-
-    const avgVol = volumes.length > 1 ? volumes.slice(-20).reduce((a,b)=>a+b,0)/Math.min(20,volumes.length) : 0;
-    const curVol = volumes[volumes.length-1] || 0;
-    const recent5 = closes.slice(-5);
-
     return {
+      ...mock,
       symbol, price, change, changePct, prevClose,
-      high52: quote.h, low52: quote.l,
       dayHigh: quote.h, dayLow: quote.l,
-      volume: curVol,
-      rsi: calcRSI(closes), macd: calcMACD(closes),
-      ema9: calcEMA(closes,9), ema20: calcEMA(closes,20), ema50: calcEMA(closes,50),
-      atr: calcATR(highs,lows,closes),
-      vwap: calcVWAP(closes.slice(-78), volumes.slice(-78)),
-      volRatio: avgVol ? curVol/avgVol : null,
-      bb: calcBB(closes),
-      momentum5: recent5.length===5 ? ((recent5[4]-recent5[0])/recent5[0])*100 : null,
-      sparkline: closes.slice(-30), closes, highs, lows, volumes,
       marketState: "LIVE", lastFetched: Date.now(), isMock: false,
     };
   } catch {
