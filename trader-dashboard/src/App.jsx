@@ -1,11 +1,14 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote, generateLiveIndicators } from "./mockData";
-import { scoreSetup, logDecision, getLog, updateDecisionOutcome } from "./model";
+import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog } from "./model";
+import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
+         calcCMF, calcMaxDrawdown, calcSharpe, calcBeta, engineerFeatures,
+         fetchAlJazeeraNews } from "./quant";
 
-const FH_QUOTE = (sym, key) => `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`;
+const FH_QUOTE  = (sym, key) => `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`;
 const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=${sym}&metric=all&token=${key}`;
 
-const WATCHLIST = ["SPY","QQQ","AAPL","NVDA","TSLA","AMD","MSFT","META","UAL","CCL","XOM","GLD"];
+const WATCHLIST = ["SPY","QQQ","AAPL","NVDA","TSLA","AMD","MSFT","META","UAL","CCL","XOM","GLD","AMZN","BNO"];
 
 const SYSTEM_PROMPT = `You are THE TRADER — the composite mind of five legendary traders. You have been given a pre-trained quantitative model score alongside live market data. Your job is to give ONE clear, decisive verdict. Not "it could go either way." A real verdict.
 
@@ -157,13 +160,24 @@ async function fetchQuote(symbol, finnhubKey) {
     const high52 = metric?.metric?.["52WeekHigh"] ?? quote.h;
     const low52  = metric?.metric?.["52WeekLow"]  ?? quote.l;
     const live = generateLiveIndicators(symbol, price, prevClose);
+    const { closes, highs, lows, volumes } = live;
+    const quant = {
+      adx:        calcADX(highs, lows, closes),
+      williamsR:  calcWilliamsR(highs, lows, closes),
+      stochastic: calcStochastic(highs, lows, closes),
+      roc:        calcROC(closes),
+      zScore:     calcZScore(closes),
+      cmf:        calcCMF(highs, lows, closes, volumes),
+      maxDrawdown:calcMaxDrawdown(closes),
+      sharpe:     calcSharpe(closes),
+    };
 
     return {
       symbol, price, change, changePct, prevClose,
       high52, low52,
       dayHigh: quote.h, dayLow: quote.l,
-      volume: quote.v ?? live.volumes[live.volumes.length-1],
-      ...live,
+      volume: quote.v ?? volumes[volumes.length-1],
+      ...live, quant,
       marketState: "LIVE", lastFetched: Date.now(), isMock: false,
     };
   } catch {
@@ -237,7 +251,7 @@ function ApiKeyModal({ onSave }) {
   );
 }
 
-function buildContext(quotes, selected) {
+function buildContext(quotes, selected, news = []) {
   const q = quotes[selected];
   if (!q) return `[No data for ${selected}]`;
   const pct52 = q.high52&&q.low52 ? ((q.price-q.low52)/(q.high52-q.low52)*100).toFixed(0) : "?";
@@ -261,16 +275,40 @@ VWAP: $${q.vwap?.toFixed(2)||"N/A"} → ${q.vwap?(q.price>q.vwap?"ABOVE (intrada
 ATR(14): $${q.atr?.toFixed(2)||"N/A"}
 Bollinger: ${q.bb?(q.bb.pos*100).toFixed(0)+"% of range (upper=$"+q.bb.upper.toFixed(2)+", lower=$"+q.bb.lower.toFixed(2)+")":"N/A"}
 
-PRE-TRAINED MODEL OUTPUT:
+=== QUANT ANALYSIS (Institutional Grade) ===
+ADX(14): ${q.quant?.adx?.adx?.toFixed(1)||"N/A"} ${q.quant?.adx?.adx>25?"(TRENDING)":"(WEAK TREND)"}  DI+: ${q.quant?.adx?.diPlus?.toFixed(1)||"?"}  DI-: ${q.quant?.adx?.diMinus?.toFixed(1)||"?"}
+Williams %R: ${q.quant?.williamsR?.toFixed(1)||"N/A"} ${q.quant?.williamsR<-80?"OVERSOLD":q.quant?.williamsR>-20?"OVERBOUGHT":"NEUTRAL"}
+Stochastic: K=${q.quant?.stochastic?.k?.toFixed(1)||"?"}  D=${q.quant?.stochastic?.d?.toFixed(1)||"?"}
+ROC(10): ${q.quant?.roc!=null?(q.quant.roc>=0?"+":"")+q.quant.roc.toFixed(2)+"%":"N/A"}
+Z-Score(20): ${q.quant?.zScore?.toFixed(2)||"N/A"} ${Math.abs(q.quant?.zScore||0)>2?"⚠ EXTENDED":"within normal range"}
+Chaikin Money Flow: ${q.quant?.cmf?.toFixed(3)||"N/A"} ${q.quant?.cmf>0.1?"BUYING PRESSURE":q.quant?.cmf<-0.1?"SELLING PRESSURE":"NEUTRAL"}
+Max Drawdown: ${q.quant?.maxDrawdown?.toFixed(2)||"N/A"}%
+Sharpe (ann.): ${q.quant?.sharpe?.toFixed(2)||"N/A"}
+
+=== FEATURE ENGINEERING ===
+${(()=>{ const f=engineerFeatures(q, quotes); return [
+  `EMA Alignment: ${f.emaScore}/3 — ${f.emaLabel}`,
+  `Momentum Composite: ${f.momentumComposite}% — ${f.momentumLabel}`,
+  `Volatility Regime: ${f.volRegime}  ATR%: ${f.atrPct}%`,
+  `BB State: ${f.bbState||"N/A"}  Bandwidth: ${f.bbBandwidth||"?"}%`,
+  `Relative Strength vs SPY: ${f.relStrVsSpy!=null?(f.relStrVsSpy>=0?"+":"")+f.relStrVsSpy+"%":"N/A"}`,
+  `VWAP Deviation: ${f.vwapDev!=null?(f.vwapDev>=0?"+":"")+f.vwapDev+"%":"N/A"}`,
+  `Volume Trend: ${f.volTrendLabel||"N/A"} (${f.volTrend||"?"}x recent vs prior)`,
+].join("\n"); })()}
+
+=== PRE-TRAINED MODEL OUTPUT ===
 LR Probability (bullish): ${model.lrProb}%
 Direction: ${model.direction} | Confidence: ${model.confidence}%
 Decision Tree: ${model.treeSignal} — ${model.treeReason}
 Nearest Crisis Analogue: ${model.crisis?.name||"N/A"} (${model.crisis?(model.crisis.similarity*100).toFixed(0)+"% similarity":"N/A"})
 Crisis Note: ${model.crisis?.note||"N/A"}
-Suggested LONG levels: entry $${q.price?.toFixed(2)}, stop $${model.stopLong||"?"}, target $${model.tgt3Long||"?"}
-Suggested SHORT levels: entry $${q.price?.toFixed(2)}, stop $${model.stopShort||"?"}, target $${model.tgt3Short||"?"}
+Suggested LONG: entry $${q.price?.toFixed(2)}, stop $${model.stopLong||"?"}, target $${model.tgt3Long||"?"}
+Suggested SHORT: entry $${q.price?.toFixed(2)}, stop $${model.stopShort||"?"}, target $${model.tgt3Short||"?"}
 
 Last 10 closes: ${q.closes?.slice(-10).map(c=>"$"+c?.toFixed(2)).join(", ")||"N/A"}
+
+=== AL JAZEERA — GEOPOLITICAL CONTEXT (last 100 days) ===
+${news.length>0 ? news.slice(0,15).map(n=>`[${n.date.toLocaleDateString()}] ${n.title}`).join("\n") : "[No news loaded — fetch from NEWS tab]"}
 
 === WATCHLIST SNAPSHOT ===
 ${snapshot}`;
@@ -289,6 +327,8 @@ export default function App() {
   const [apiKey, setApiKey] = useState(()=>localStorage.getItem("anthropic_key")||"");
   const [finnhubKey, setFinnhubKey] = useState(()=>localStorage.getItem("finnhub_key")||"");
   const [decisionLog, setDecisionLog] = useState(()=>getLog());
+  const [news, setNews] = useState([]);
+  const [newsLoading, setNewsLoading] = useState(false);
   const chatRef = useRef(null);
 
   const refreshAll = useCallback(async (silent=false) => {
@@ -308,12 +348,20 @@ export default function App() {
   }, [refreshAll]);
 
   useEffect(() => {
+    setNewsLoading(true);
+    fetchAlJazeeraNews()
+      .then(articles => setNews(articles))
+      .catch(()=>{})
+      .finally(()=>setNewsLoading(false));
+  }, []);
+
+  useEffect(() => {
     if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight;
   }, [messages, thinking]);
 
   async function sendToAI(userText) {
     setThinking(true);
-    const context = buildContext(quotes, selected);
+    const context = buildContext(quotes, selected, news);
     const fullContent = `${context}\n\nUSER: ${userText}`;
     const newHistory = [...chatHistory, { role:"user", content:fullContent }];
     setChatHistory(newHistory);
@@ -329,7 +377,7 @@ export default function App() {
         },
         body: JSON.stringify({
           model: "claude-sonnet-4-5",
-          max_tokens: 1500,
+          max_tokens: 4096,
           system: SYSTEM_PROMPT,
           messages: newHistory,
         }),
@@ -342,13 +390,23 @@ export default function App() {
       const reply = data.content?.filter(b=>b.type==="text").map(b=>b.text).join("\n")||"No response.";
       setChatHistory(prev=>[...prev,{role:"assistant",content:reply}]);
       setMessages(prev=>[...prev,{type:"bot",text:reply}]);
-      // Auto-log decision if reply contains a verdict
+      // Auto-log BUY/SELL verdicts only
       const q = quotes[selected];
-      if (q && /FINAL VERDICT/i.test(reply)) {
+      if (q && /FINAL VERDICT:\s*(BUY|SELL)/i.test(reply)) {
         const model = scoreSetup(q);
-        const dirMatch = reply.match(/FINAL VERDICT:\s*(BUY|SELL|AVOID|WAIT)/i);
-        const direction = dirMatch ? dirMatch[1].toUpperCase() : model.direction;
-        logDecision({ symbol: selected, entryPrice: q.price, direction, modelScore: model, reply: reply.slice(0,300) });
+        const verdict    = reply.match(/FINAL VERDICT:\s*(BUY|SELL)/i)?.[1]?.toUpperCase();
+        const stopMatch  = reply.match(/Stop:\s*\$?([\d.]+)/i);
+        const tgtMatch   = reply.match(/Target:\s*\$?([\d.]+)/i);
+        const rrMatch    = reply.match(/R\/R:\s*([\d.]+)/i);
+        const confMatch  = reply.match(/Confidence:\s*(HIGH|MEDIUM|LOW)/i);
+        logDecision({
+          symbol: selected, entryPrice: q.price, verdict,
+          stop:   stopMatch  ? parseFloat(stopMatch[1])  : null,
+          target: tgtMatch   ? parseFloat(tgtMatch[1])   : null,
+          rr:     rrMatch    ? parseFloat(rrMatch[1])    : null,
+          confidence: confMatch ? confMatch[1] : null,
+          modelScore: { direction: model.direction, confidence: model.confidence, treeSignal: model.treeSignal },
+        });
         setDecisionLog(getLog());
       }
     } catch(err) {
@@ -481,7 +539,7 @@ export default function App() {
 
           {/* Tabs */}
           <div style={{display:"flex",borderBottom:"1px solid #1A1A1A",background:"#0C0C0C",flexShrink:0}}>
-            {[["chat","💬 ANALYSIS"],["data","📊 RAW DATA"],["log","📋 DECISION LOG"],["model","🤖 MODEL"]].map(([t,label])=>(
+            {[["chat","💬 ANALYSIS"],["data","📊 RAW DATA"],["log","📋 LOG"],["model","🤖 MODEL"],["quant","📐 QUANT"],["news","📰 NEWS"]].map(([t,label])=>(
               <button key={t} onClick={()=>setTab(t)} style={{
                 padding:"8px 14px",fontSize:9,letterSpacing:2,textTransform:"uppercase",
                 background:tab===t?"#1A1A1A":"transparent",border:"none",
@@ -495,7 +553,7 @@ export default function App() {
           {tab==="data"&&(
             <div style={{flex:1,overflowY:"auto",padding:14,fontSize:11,color:"#888"}}>
               <pre style={{whiteSpace:"pre-wrap",fontFamily:"'Courier New',monospace",fontSize:11,margin:0}}>
-                {buildContext(quotes,selected)}
+                {buildContext(quotes,selected,news)}
               </pre>
             </div>
           )}
@@ -557,47 +615,149 @@ export default function App() {
             );
           })()}
 
-          {tab==="log"&&(
-            <div style={{flex:1,overflowY:"auto",padding:14}}>
-              <div style={{color:"#C9A84C",fontSize:11,letterSpacing:2,marginBottom:12}}>DECISION LOG — {decisionLog.length} trades</div>
-              {decisionLog.length===0&&<div style={{color:"#333",fontSize:11}}>No decisions logged yet. Run an analysis to start tracking.</div>}
-              {decisionLog.map(d=>{
-                const q = quotes[d.symbol];
-                const currentPrice = q?.price;
-                const pnl = currentPrice ? (d.direction==="BUY"
-                  ? ((currentPrice-d.entryPrice)/d.entryPrice*100)
-                  : ((d.entryPrice-currentPrice)/d.entryPrice*100)
-                ).toFixed(2) : null;
-                const pnlColor = pnl==null?"#555":pnl>0?"#2ECC71":"#E74C3C";
-                return (
-                  <div key={d.id} style={{background:"#0F0F0F",border:"1px solid #1A1A1A",
-                    borderLeft:`3px solid ${d.direction==="BUY"?"#2ECC71":d.direction==="SELL"?"#E74C3C":"#555"}`,
-                    padding:10,marginBottom:8}}>
-                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
-                      <span style={{fontWeight:700,color:"#FFF",fontSize:12}}>{d.symbol}</span>
-                      <span style={{fontSize:9,color:"#555"}}>{new Date(d.timestamp).toLocaleString()}</span>
+          {tab==="log"&&(()=>{
+            const stats = getPerformanceStats();
+            return (
+              <div style={{flex:1,overflowY:"auto",padding:14}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+                  <div style={{color:"#C9A84C",fontSize:11,letterSpacing:2}}>DECISION LOG — {decisionLog.length} trades</div>
+                  {stats&&<div style={{fontSize:10,color:"#888"}}>
+                    Win rate: <span style={{color:stats.winRate>50?"#2ECC71":"#E74C3C",fontWeight:700}}>{stats.winRate}%</span>
+                    &nbsp;·&nbsp;Avg P&L: <span style={{color:stats.avgPnl>0?"#2ECC71":"#E74C3C",fontWeight:700}}>{stats.avgPnl>0?"+":""}{stats.avgPnl}%</span>
+                    &nbsp;·&nbsp;{stats.wins}W / {stats.losses}L
+                  </div>}
+                </div>
+                {decisionLog.length===0&&<div style={{color:"#333",fontSize:11,lineHeight:1.7}}>
+                  No decisions logged yet.<br/>Run an analysis — if the AI says BUY or SELL it gets logged here automatically.
+                </div>}
+                {decisionLog.map(d=>{
+                  const q = quotes[d.symbol];
+                  const currentPrice = q?.price;
+                  const livePnl = currentPrice && !d.reviewed ? (d.verdict==="BUY"
+                    ? ((currentPrice-d.entryPrice)/d.entryPrice*100)
+                    : ((d.entryPrice-currentPrice)/d.entryPrice*100)
+                  ).toFixed(2) : null;
+                  const pnl = d.reviewed ? d.pnlPct : livePnl;
+                  const verdictColor = d.verdict==="BUY"?"#2ECC71":"#E74C3C";
+                  const outcomeColor = d.outcome==="WIN"?"#2ECC71":d.outcome==="LOSS"?"#E74C3C":"#C9A84C";
+                  return (
+                    <div key={d.id} style={{background:"#0C0C0C",border:"1px solid #1A1A1A",
+                      borderLeft:`3px solid ${verdictColor}`,padding:12,marginBottom:8}}>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                        <div>
+                          <span style={{fontWeight:900,color:"#FFF",fontSize:14,letterSpacing:1}}>{d.symbol}</span>
+                          <span style={{marginLeft:10,fontWeight:900,color:verdictColor,fontSize:13}}>{d.verdict}</span>
+                          {d.confidence&&<span style={{marginLeft:8,fontSize:9,color:"#555",letterSpacing:1}}>CONF: {d.confidence}</span>}
+                        </div>
+                        <span style={{fontSize:9,color:"#444"}}>{new Date(d.timestamp).toLocaleString()}</span>
+                      </div>
+                      <div style={{display:"flex",gap:14,marginTop:8,fontSize:10,color:"#888",flexWrap:"wrap"}}>
+                        <span>Entry: <b style={{color:"#FFF"}}>${d.entryPrice?.toFixed(2)}</b></span>
+                        {d.stop&&<span>Stop: <b style={{color:"#E74C3C"}}>${d.stop}</b></span>}
+                        {d.target&&<span>Target: <b style={{color:"#2ECC71"}}>${d.target}</b></span>}
+                        {d.rr&&<span>R/R: <b style={{color:"#C9A84C"}}>{d.rr}:1</b></span>}
+                        {currentPrice&&!d.reviewed&&<span>Now: <b style={{color:"#FFF"}}>${currentPrice?.toFixed(2)}</b></span>}
+                        {pnl!=null&&<span>P&L: <b style={{color:pnl>0?"#2ECC71":"#E74C3C"}}>{pnl>0?"+":""}{pnl}%</b></span>}
+                        {d.reviewed&&<span style={{color:outcomeColor,fontWeight:900}}>{d.outcome}</span>}
+                      </div>
+                      <div style={{fontSize:9,color:"#333",marginTop:6}}>
+                        Model: {d.modelScore?.direction} · Tree: {d.modelScore?.treeSignal} · Confidence: {d.modelScore?.confidence}%
+                      </div>
+                      {!d.reviewed&&currentPrice&&(
+                        <button onClick={()=>setDecisionLog(reviewDecision(d.id, currentPrice))}
+                          style={{marginTop:8,background:"#1A1500",border:"1px solid #C9A84C",color:"#C9A84C",
+                            fontSize:9,padding:"4px 10px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
+                          ✓ REVIEW NOW (at ${currentPrice?.toFixed(2)})
+                        </button>
+                      )}
                     </div>
-                    <div style={{display:"flex",gap:16,marginTop:6,fontSize:10}}>
-                      <span style={{color:d.direction==="BUY"?"#2ECC71":d.direction==="SELL"?"#E74C3C":"#C9A84C",fontWeight:700}}>
-                        {d.direction}
-                      </span>
-                      <span style={{color:"#888"}}>Entry: ${d.entryPrice?.toFixed(2)}</span>
-                      {currentPrice&&<span style={{color:"#888"}}>Now: ${currentPrice?.toFixed(2)}</span>}
-                      {pnl!=null&&<span style={{color:pnlColor,fontWeight:700}}>{pnl>0?"+":""}{pnl}%</span>}
+                  );
+                })}
+                {decisionLog.length>0&&(
+                  <button onClick={()=>{localStorage.removeItem("trader_decision_log");setDecisionLog([]);}}
+                    style={{marginTop:8,background:"#1A0808",border:"1px solid #4A1A1A",color:"#E74C3C",
+                      fontSize:9,padding:"5px 12px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
+                    CLEAR LOG
+                  </button>
+                )}
+              </div>
+            );
+          })()}
+
+          {tab==="quant"&&(()=>{
+            const q = quotes[selected];
+            if (!q) return <div style={{padding:14,color:"#333"}}>No data</div>;
+            const qt = q.quant||{};
+            const f = engineerFeatures(q, quotes);
+            const beta = calcBeta(q.closes||[], quotes.SPY?.closes||[]);
+            const rows = [
+              ["ADX(14)", qt.adx?.adx?.toFixed(1)||"—", qt.adx?.adx>25?"TRENDING":"WEAK", qt.adx?.adx>50?"#E74C3C":qt.adx?.adx>25?"#C9A84C":"#555"],
+              ["DI+ / DI−", `${qt.adx?.diPlus?.toFixed(1)||"?"}  /  ${qt.adx?.diMinus?.toFixed(1)||"?"}`, qt.adx?.diPlus>qt.adx?.diMinus?"BULL DI":"BEAR DI", qt.adx?.diPlus>qt.adx?.diMinus?"#2ECC71":"#E74C3C"],
+              ["Williams %R", qt.williamsR?.toFixed(1)||"—", qt.williamsR<-80?"OVERSOLD":qt.williamsR>-20?"OVERBOUGHT":"NEUTRAL", qt.williamsR<-80?"#2ECC71":qt.williamsR>-20?"#E74C3C":"#888"],
+              ["Stoch K/D", `${qt.stochastic?.k?.toFixed(1)||"?"}  /  ${qt.stochastic?.d?.toFixed(1)||"?"}`, qt.stochastic?.k>80?"OVERBOUGHT":qt.stochastic?.k<20?"OVERSOLD":"NEUTRAL", qt.stochastic?.k>80?"#E74C3C":qt.stochastic?.k<20?"#2ECC71":"#888"],
+              ["ROC(10)", qt.roc!=null?(qt.roc>=0?"+":"")+qt.roc.toFixed(2)+"%":"—", qt.roc>0?"POSITIVE":"NEGATIVE", qt.roc>0?"#2ECC71":"#E74C3C"],
+              ["Z-Score(20)", qt.zScore?.toFixed(2)||"—", Math.abs(qt.zScore||0)>2?"EXTENDED":Math.abs(qt.zScore||0)>1?"ELEVATED":"NORMAL", Math.abs(qt.zScore||0)>2?"#E74C3C":Math.abs(qt.zScore||0)>1?"#C9A84C":"#888"],
+              ["CMF(20)", qt.cmf?.toFixed(3)||"—", qt.cmf>0.1?"BUYING":qt.cmf<-0.1?"SELLING":"NEUTRAL", qt.cmf>0.1?"#2ECC71":qt.cmf<-0.1?"#E74C3C":"#888"],
+              ["Max Drawdown", qt.maxDrawdown?.toFixed(2)+"%"||"—", "from peak", qt.maxDrawdown>20?"#E74C3C":"#888"],
+              ["Sharpe (ann.)", qt.sharpe?.toFixed(2)||"—", qt.sharpe>1?"GOOD":qt.sharpe>0?"POSITIVE":qt.sharpe!=null?"NEGATIVE":"—", qt.sharpe>1?"#2ECC71":qt.sharpe>0?"#C9A84C":"#E74C3C"],
+              ["Beta vs SPY", beta?.toFixed(2)||"—", beta>1.5?"HIGH BETA":beta<0.5?"LOW BETA":"MODERATE", beta>1.5?"#E74C3C":"#888"],
+            ];
+            return (
+              <div style={{flex:1,overflowY:"auto",padding:14}}>
+                <div style={{color:"#C9A84C",fontSize:11,letterSpacing:2,marginBottom:12}}>INSTITUTIONAL QUANT — {selected}</div>
+                <div style={{marginBottom:16}}>
+                  {rows.map(([label,val,note,color])=>(
+                    <div key={label} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+                      padding:"7px 10px",borderBottom:"1px solid #111",background:"#0C0C0C"}}>
+                      <span style={{fontSize:10,color:"#555",letterSpacing:1,width:120}}>{label}</span>
+                      <span style={{fontSize:12,color:"#FFF",fontWeight:700,width:100,textAlign:"center"}}>{val}</span>
+                      <span style={{fontSize:9,color,letterSpacing:1,width:120,textAlign:"right"}}>{note}</span>
                     </div>
-                    <div style={{fontSize:9,color:"#444",marginTop:4}}>
-                      Model: {d.modelScore?.direction} ({d.modelScore?.confidence}% confidence) · Tree: {d.modelScore?.treeSignal}
-                    </div>
+                  ))}
+                </div>
+                <div style={{color:"#C9A84C",fontSize:11,letterSpacing:2,marginBottom:8}}>FEATURE ENGINEERING</div>
+                {[
+                  ["EMA Alignment",`${f.emaScore}/3 — ${f.emaLabel}`],
+                  ["Momentum Composite",`${f.momentumComposite}% — ${f.momentumLabel}`],
+                  ["Volatility Regime",f.volRegime],
+                  ["BB State",`${f.bbState||"N/A"}  bw=${f.bbBandwidth||"?"}%`],
+                  ["Rel. Strength vs SPY",`${f.relStrVsSpy!=null?(f.relStrVsSpy>=0?"+":"")+f.relStrVsSpy+"%":"N/A"}`],
+                  ["VWAP Deviation",`${f.vwapDev!=null?(f.vwapDev>=0?"+":"")+f.vwapDev+"%":"N/A"}`],
+                  ["Volume Trend",`${f.volTrendLabel||"N/A"} (${f.volTrend||"?"}x)`],
+                ].map(([l,v])=>(
+                  <div key={l} style={{display:"flex",justifyContent:"space-between",padding:"6px 10px",borderBottom:"1px solid #0F0F0F"}}>
+                    <span style={{fontSize:10,color:"#555"}}>{l}</span>
+                    <span style={{fontSize:10,color:"#C9A84C",fontWeight:600}}>{v}</span>
                   </div>
-                );
-              })}
-              {decisionLog.length>0&&(
-                <button onClick={()=>{localStorage.removeItem("trader_decision_log");setDecisionLog([]);}}
-                  style={{marginTop:8,background:"#1A0808",border:"1px solid #4A1A1A",color:"#E74C3C",
-                    fontSize:9,padding:"5px 12px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
-                  CLEAR LOG
+                ))}
+              </div>
+            );
+          })()}
+
+          {tab==="news"&&(
+            <div style={{flex:1,overflowY:"auto",padding:14}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+                <div style={{color:"#C9A84C",fontSize:11,letterSpacing:2}}>AL JAZEERA — GEOPOLITICAL CONTEXT</div>
+                <button onClick={()=>{setNewsLoading(true);fetchAlJazeeraNews().then(a=>setNews(a)).finally(()=>setNewsLoading(false));}}
+                  style={{background:"#1A1A1A",border:"1px solid #2A2A2A",color:"#888",fontSize:9,
+                    padding:"3px 8px",cursor:"pointer",letterSpacing:1,fontFamily:"inherit"}}>
+                  ↻ REFRESH
                 </button>
+              </div>
+              {newsLoading&&<div style={{color:"#555",fontSize:10,letterSpacing:1}}>FETCHING NEWS...</div>}
+              {!newsLoading&&news.length===0&&(
+                <div style={{color:"#333",fontSize:11,lineHeight:1.7}}>
+                  No articles loaded. Al Jazeera RSS may be blocked by the proxy.<br/>
+                  Try clicking REFRESH or check your network.
+                </div>
               )}
+              {news.map((n,i)=>(
+                <div key={i} style={{padding:"10px 0",borderBottom:"1px solid #111"}}>
+                  <div style={{fontSize:11,color:"#D8D0C0",lineHeight:1.5,marginBottom:4}}>{n.title}</div>
+                  <div style={{fontSize:9,color:"#444",marginBottom:4}}>{n.date.toLocaleDateString()} {n.date.toLocaleTimeString()}</div>
+                  {n.desc&&<div style={{fontSize:10,color:"#555",lineHeight:1.5}}>{n.desc}</div>}
+                </div>
+              ))}
             </div>
           )}
 

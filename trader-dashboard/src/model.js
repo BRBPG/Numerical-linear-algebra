@@ -125,22 +125,52 @@ export function scoreSetup(q) {
 // ─── Decision log (localStorage) ────────────────────────────────────────────
 const LOG_KEY = "trader_decision_log";
 
-export function logDecision(entry) {
+export function logDecision({ symbol, entryPrice, verdict, stop, target, rr, confidence, modelScore }) {
+  if (!["BUY","SELL"].includes(verdict)) return; // only log actionable decisions
   const log = getLog();
-  log.unshift({ ...entry, id: Date.now(), timestamp: new Date().toISOString() });
-  localStorage.setItem(LOG_KEY, JSON.stringify(log.slice(0, 100))); // keep last 100
+  log.unshift({
+    id: Date.now(),
+    timestamp: new Date().toISOString(),
+    symbol,
+    entryPrice,
+    verdict,       // "BUY" or "SELL"
+    stop,          // stop loss level
+    target,        // profit target
+    rr,            // reward/risk ratio
+    confidence,
+    modelScore,
+    reviewed: false,
+    outcome: null, // "WIN" | "LOSS" | "OPEN"
+    reviewPrice: null,
+    pnlPct: null,
+  });
+  localStorage.setItem(LOG_KEY, JSON.stringify(log.slice(0, 200)));
 }
 
-export function updateDecisionOutcome(id, currentPrice) {
+// Called when user clicks "Review" at end of day
+export function reviewDecision(id, currentPrice) {
   const log = getLog();
   const idx = log.findIndex(d => d.id === id);
-  if (idx === -1) return;
+  if (idx === -1) return log;
   const d = log[idx];
-  const pnlPct = d.direction === "BULLISH"
-    ? ((currentPrice - d.entryPrice) / d.entryPrice * 100).toFixed(2)
-    : ((d.entryPrice - currentPrice) / d.entryPrice * 100).toFixed(2);
-  log[idx] = { ...d, currentPrice, pnlPct, resolved: true };
+  const pnlPct = d.verdict === "BUY"
+    ? ((currentPrice - d.entryPrice) / d.entryPrice * 100)
+    : ((d.entryPrice - currentPrice) / d.entryPrice * 100);
+  const hitStop   = d.stop   && (d.verdict==="BUY" ? currentPrice<=d.stop   : currentPrice>=d.stop);
+  const hitTarget = d.target && (d.verdict==="BUY" ? currentPrice>=d.target : currentPrice<=d.target);
+  const outcome = hitTarget ? "WIN" : hitStop ? "LOSS" : pnlPct > 0 ? "WIN" : "LOSS";
+  log[idx] = { ...d, reviewed: true, reviewPrice: currentPrice, pnlPct: pnlPct.toFixed(2), outcome };
   localStorage.setItem(LOG_KEY, JSON.stringify(log));
+  return log;
+}
+
+// Returns win rate and avg P&L from reviewed decisions
+export function getPerformanceStats() {
+  const log = getLog().filter(d => d.reviewed);
+  if (log.length === 0) return null;
+  const wins = log.filter(d => d.outcome === "WIN").length;
+  const avgPnl = log.reduce((s,d) => s + parseFloat(d.pnlPct||0), 0) / log.length;
+  return { total: log.length, wins, losses: log.length-wins, winRate: (wins/log.length*100).toFixed(0), avgPnl: avgPnl.toFixed(2) };
 }
 
 export function getLog() {
