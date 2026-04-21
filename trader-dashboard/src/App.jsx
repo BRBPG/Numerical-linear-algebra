@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { generateMockQuote } from "./mockData";
+import { generateMockQuote, generateLiveIndicators } from "./mockData";
 
 // Finnhub endpoints — browser-friendly, no CORS issues
 const FH_QUOTE = (sym, key) => `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`;
@@ -79,17 +79,18 @@ async function fetchQuote(symbol, finnhubKey) {
     const prevClose = quote.pc;
     if (!price || !prevClose) return generateMockQuote(symbol);
 
-    const mock = generateMockQuote(symbol);
     const change = price - prevClose;
     const changePct = (change / prevClose) * 100;
     const high52 = metric?.metric?.["52WeekHigh"] ?? quote.h;
     const low52  = metric?.metric?.["52WeekLow"]  ?? quote.l;
+    const live = generateLiveIndicators(symbol, price, prevClose);
 
     return {
-      ...mock,
       symbol, price, change, changePct, prevClose,
-      dayHigh: quote.h, dayLow: quote.l,
       high52, low52,
+      dayHigh: quote.h, dayLow: quote.l,
+      volume: quote.v ?? live.volumes[live.volumes.length-1],
+      ...live,
       marketState: "LIVE", lastFetched: Date.now(), isMock: false,
     };
   } catch {
