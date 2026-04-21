@@ -163,31 +163,57 @@ export function engineerFeatures(q, allQuotes) {
   return f;
 }
 
-// ─── Al Jazeera RSS news ─────────────────────────────────────────────────────
-const AJ_RSS = "https://www.aljazeera.com/xml/rss/all.xml";
-const AJ_PROXIES = [
+// ─── Multi-source news aggregation ──────────────────────────────────────────
+const PROXIES = [
   u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
   u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
 ];
 
-export async function fetchAlJazeeraNews() {
-  const cutoff = Date.now() - 100*24*60*60*1000;
-  for (const proxy of AJ_PROXIES) {
+const NEWS_FEEDS = [
+  { source: "Al Jazeera",  url: "https://www.aljazeera.com/xml/rss/all.xml" },
+  { source: "Reuters",     url: "https://feeds.reuters.com/reuters/businessNews" },
+  { source: "Reuters Mkt", url: "https://feeds.reuters.com/news/wealth" },
+  { source: "MarketWatch", url: "https://feeds.content.dowjones.io/public/rss/mw_topstories" },
+  { source: "MarketWatch Real-time", url: "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines" },
+  { source: "CNBC Top",    url: "https://www.cnbc.com/id/100003114/device/rss/rss.html" },
+  { source: "CNBC Mkt",    url: "https://www.cnbc.com/id/15839135/device/rss/rss.html" },
+  { source: "BBC Business",url: "https://feeds.bbci.co.uk/news/business/rss.xml" },
+  { source: "Yahoo Fin",   url: "https://finance.yahoo.com/news/rssindex" },
+];
+
+async function fetchFeed(source, url, cutoff) {
+  for (const proxy of PROXIES) {
     try {
-      const res = await fetch(proxy(AJ_RSS), {signal: AbortSignal.timeout(10000)});
+      const res = await fetch(proxy(url), {signal: AbortSignal.timeout(10000)});
       if (!res.ok) continue;
       const text = await res.text();
       const doc = new DOMParser().parseFromString(text, "text/xml");
       const items = [...doc.querySelectorAll("item")];
       return items.map(el => ({
+        source,
         title: el.querySelector("title")?.textContent?.trim()||"",
         date: new Date(el.querySelector("pubDate")?.textContent||0),
         link: el.querySelector("link")?.textContent?.trim()||"",
-        desc: (el.querySelector("description")?.textContent||"").replace(/<[^>]*>/g,"").slice(0,200),
-      }))
-      .filter(n => n.date.getTime() > cutoff && n.title)
-      .slice(0, 60);
+        desc: (el.querySelector("description")?.textContent||"").replace(/<[^>]*>/g,"").slice(0,220),
+      })).filter(n => n.date.getTime() > cutoff && n.title);
     } catch { continue; }
   }
   return [];
+}
+
+// Fetch all news sources in parallel and merge, sorted by date desc
+export async function fetchAllNews() {
+  const cutoff = Date.now() - 100*24*60*60*1000;
+  const results = await Promise.all(
+    NEWS_FEEDS.map(f => fetchFeed(f.source, f.url, cutoff).catch(()=>[]))
+  );
+  const merged = results.flat()
+    .sort((a,b) => b.date.getTime() - a.date.getTime())
+    .slice(0, 500);
+  return merged;
+}
+
+// Kept for backwards compatibility
+export async function fetchAlJazeeraNews() {
+  return fetchAllNews();
 }

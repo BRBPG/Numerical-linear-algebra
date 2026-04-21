@@ -1,9 +1,9 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { generateMockQuote, generateLiveIndicators } from "./mockData";
-import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog } from "./model";
+import { scoreSetup, logDecision, reviewDecision, getPerformanceStats, getLog, adaptWeights, resetWeights, getCurrentWeights } from "./model";
 import { calcADX, calcWilliamsR, calcStochastic, calcROC, calcZScore,
          calcCMF, calcMaxDrawdown, calcSharpe, calcBeta, engineerFeatures,
-         fetchAlJazeeraNews } from "./quant";
+         fetchAllNews } from "./quant";
 
 const FH_QUOTE  = (sym, key) => `https://finnhub.io/api/v1/quote?symbol=${sym}&token=${key}`;
 const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=${sym}&metric=all&token=${key}`;
@@ -11,6 +11,9 @@ const FH_METRIC = (sym, key) => `https://finnhub.io/api/v1/stock/metric?symbol=$
 const WATCHLIST = ["SPY","QQQ","AAPL","NVDA","TSLA","AMD","MSFT","META","UAL","CCL","XOM","GLD","AMZN","BNO"];
 
 const SYSTEM_PROMPT = `You are THE TRADER — the composite mind of five legendary traders. You have been given a pre-trained quantitative model score alongside live market data. Your job is to give ONE clear, decisive verdict. Not "it could go either way." A real verdict.
+
+═══ ABSOLUTE DIRECTIVE — READ THIS FIRST ═══
+Every session you MUST produce an actionable BUY or SELL. At every moment money can be made — either long or short. Markets always favour one direction more than the other. "AVOID" and "WAIT" are BANNED except in one specific case: crisis-level volatility where the model shows ATR >4%, 5-bar momentum <-5%, AND volume >3x average simultaneously. Anything else is a BUY or a SELL. If your first instinct is AVOID, you haven't done the work — look harder at both sides and pick the one with marginally better odds. A 55/45 edge played with discipline makes money over 1000 trades. Passivity does not.
 
 ═══ THE FIVE MINDS ═══
 
@@ -70,7 +73,7 @@ YOUR OUTPUT FORMAT — follow this exactly, every time:
 📊 TAPE READING
 [2-3 sentences. What is the price action saying RIGHT NOW? Is the trend up or down? Is volume confirming? Be specific about levels. No vague language.]
 
-🤖 MODEL SIGNAL: [BUY/SELL/AVOID] [confidence]% — [one line explanation]
+🤖 MODEL SIGNAL: [BUY/SELL] [confidence]% — [one line explanation]
 
 🧠 TRADER CONSENSUS
 LIVERMORE: [one specific opinion with reasoning]
@@ -79,19 +82,21 @@ DENNIS: [one specific opinion — is there a breakout? Where is the 2-ATR stop?]
 SIMONS: [one specific opinion — what do the stats say? Volume confirmation?]
 WILLIAMS: [one specific opinion — is the crowd wrong here?]
 
-⚡ FINAL VERDICT: [BUY / SELL / AVOID / WAIT]
+⚡ FINAL VERDICT: BUY or SELL (pick one — no other options)
 Entry: $X.XX | Stop: $X.XX | Target: $X.XX | R/R: X:1
 Confidence: [HIGH/MEDIUM/LOW]
 
-⚠️ RISK: [One sentence. Position size, max loss, acknowledge you can be wrong.]
+⚠️ RISK: [One sentence. Position size (1-2% of account), max loss, acknowledge you can be wrong.]
 
-CRITICAL RULES:
-- If the model says AVOID and you agree: say AVOID and explain why no setup exists
-- If RSI is between 40-60, EMA is flat, volume is normal: say WAIT — do not force a trade
-- If you say BUY or SELL, you MUST give specific dollar levels for entry, stop, and target
-- Never use the phrase "it could go either way" — make a call
-- If R/R is below 3:1: say AVOID regardless of everything else
-- Extended >2 ATR from last pivot: say AVOID (Livermore's rule — never chase)`;
+CRITICAL RULES — NON-NEGOTIABLE:
+- FINAL VERDICT must be BUY or SELL. No AVOID, no WAIT, no HOLD, no "no trade today." Pick a side.
+- The ONLY exception: genuine crisis conditions (ATR >4% of price AND momentum <-5% AND volume >3x). If those three are all true, you may output AVOID — otherwise BUY or SELL.
+- R/R floor: 2:1 minimum (lowered from the textbook 3:1 because active trading = more opportunities). If a 2:1 can't be constructed with the current ATR, use a 1.5 ATR stop and 3.5 ATR target.
+- When the setup is genuinely mixed, default to the direction the decision-tree model suggests, then justify it through the trader lens with the cleanest entry you can find.
+- If you say BUY or SELL, you MUST give specific dollar levels for entry, stop, and target. Entry should usually be the current price (market order) unless you want a specific limit level — say which.
+- If RSI is 40-60 and EMA is flat: do NOT say WAIT. Look at Williams %R, Stochastic, CMF, volume trend. One of them will tip the bias — use it.
+- Confidence calibration: HIGH = 3+ legends agree and model agrees. MEDIUM = 2 agree. LOW = mixed but you still pick a side.
+- When asked "best opportunity" across multiple stocks: rank them, pick ONE, commit to the trade.`;
 
 
 function calcEMA(prices, period) {
@@ -251,6 +256,52 @@ function ApiKeyModal({ onSave }) {
   );
 }
 
+// Rank all loaded quotes by model edge and return the top N
+function rankOpportunities(quotes, topN = 3) {
+  return Object.values(quotes)
+    .filter(q => q && q.price)
+    .map(q => {
+      const m = scoreSetup(q);
+      const edge = Math.abs(parseFloat(m.lrProb) - 50); // 0–50, higher = more conviction
+      const treeBoost = m.treeSignal === "STRONG_BUY" || m.treeSignal === "STRONG_SELL" ? 8 : 0;
+      const atrPct = q.atr && q.price ? (q.atr / q.price) * 100 : 0;
+      const volBoost = (q.volRatio ?? 1) > 1.3 ? 4 : 0;
+      const score = edge + treeBoost + volBoost;
+      return { q, m, score };
+    })
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topN);
+}
+
+function buildBestOpportunityContext(quotes, news = []) {
+  const top = rankOpportunities(quotes, 3);
+  const blocks = top.map(({ q, m }, i) => {
+    const pct52 = q.high52 && q.low52 ? ((q.price - q.low52) / (q.high52 - q.low52) * 100).toFixed(0) : "?";
+    return `
+--- CANDIDATE ${i + 1}: ${q.symbol} ---
+Price: $${q.price?.toFixed(2)}  Change: ${q.changePct >= 0 ? "+" : ""}${q.changePct?.toFixed(2)}%  52W pct: ${pct52}th
+RSI: ${q.rsi?.toFixed(1) || "N/A"}  MACD: ${q.macd != null ? (q.macd > 0 ? "BULL" : "BEAR") : "N/A"}  ATR: $${q.atr?.toFixed(2) || "N/A"}
+EMA9/20/50: $${q.ema9?.toFixed(2) || "?"} / $${q.ema20?.toFixed(2) || "?"} / $${q.ema50?.toFixed(2) || "?"}
+BB: ${q.bb ? (q.bb.pos * 100).toFixed(0) + "% of range" : "N/A"}  VWAP: $${q.vwap?.toFixed(2) || "N/A"}  Vol: ${q.volRatio?.toFixed(1) || "N/A"}x
+ADX: ${q.quant?.adx?.adx?.toFixed(1) || "N/A"}  Williams%R: ${q.quant?.williamsR?.toFixed(1) || "N/A"}  CMF: ${q.quant?.cmf?.toFixed(3) || "N/A"}
+LR Score: ${m.lrProb}% (${m.direction})  Tree: ${m.treeSignal} — ${m.treeReason}
+Crisis Match: ${m.crisis?.name || "N/A"} (${m.crisis ? (m.crisis.similarity * 100).toFixed(0) : 0}%)
+Suggested LONG: entry $${q.price?.toFixed(2)}, stop $${m.stopLong || "?"}, target $${m.tgt3Long || "?"}
+Suggested SHORT: entry $${q.price?.toFixed(2)}, stop $${m.stopShort || "?"}, target $${m.tgt3Short || "?"}`;
+  }).join("\n");
+
+  const headlineBlurb = news.length > 0
+    ? `\n=== TOP HEADLINES (last 100 days) ===\n${news.slice(0, 10).map(n => `[${n.source || ""}] ${n.title}`).join("\n")}`
+    : "";
+
+  return `=== BEST OPPORTUNITY SCAN — ${new Date().toLocaleTimeString()} ===
+The system has ranked ALL ${Object.keys(quotes).length} watchlist symbols by model conviction. The top 3 candidates are presented below. You MUST choose exactly ONE and provide a full actionable trade.
+${blocks}
+${headlineBlurb}
+
+INSTRUCTION: Review all three candidates. Choose the ONE with the cleanest, highest-conviction setup right now. Use the full output format. FINAL VERDICT must be BUY or SELL with specific levels.`;
+}
+
 function buildContext(quotes, selected, news = []) {
   const q = quotes[selected];
   if (!q) return `[No data for ${selected}]`;
@@ -307,8 +358,8 @@ Suggested SHORT: entry $${q.price?.toFixed(2)}, stop $${model.stopShort||"?"}, t
 
 Last 10 closes: ${q.closes?.slice(-10).map(c=>"$"+c?.toFixed(2)).join(", ")||"N/A"}
 
-=== AL JAZEERA — GEOPOLITICAL CONTEXT (last 100 days) ===
-${news.length>0 ? news.slice(0,15).map(n=>`[${n.date.toLocaleDateString()}] ${n.title}`).join("\n") : "[No news loaded — fetch from NEWS tab]"}
+=== LIVE NEWS — GEOPOLITICAL & MARKET CONTEXT (last 100 days) ===
+${news.length>0 ? news.slice(0,20).map(n=>`[${n.date.toLocaleDateString()}][${n.source||"News"}] ${n.title}`).join("\n") : "[No news loaded — fetch from NEWS tab]"}
 
 === WATCHLIST SNAPSHOT ===
 ${snapshot}`;
@@ -349,7 +400,7 @@ export default function App() {
 
   useEffect(() => {
     setNewsLoading(true);
-    fetchAlJazeeraNews()
+    fetchAllNews()
       .then(articles => setNews(articles))
       .catch(()=>{})
       .finally(()=>setNewsLoading(false));
@@ -376,7 +427,7 @@ export default function App() {
           "anthropic-dangerous-direct-browser-access": "true",
         },
         body: JSON.stringify({
-          model: "claude-sonnet-4-5",
+          model: "claude-opus-4-5",
           max_tokens: 4096,
           system: SYSTEM_PROMPT,
           messages: newHistory,
@@ -390,24 +441,28 @@ export default function App() {
       const reply = data.content?.filter(b=>b.type==="text").map(b=>b.text).join("\n")||"No response.";
       setChatHistory(prev=>[...prev,{role:"assistant",content:reply}]);
       setMessages(prev=>[...prev,{type:"bot",text:reply}]);
-      // Auto-log BUY/SELL verdicts only
+      // Log ALL verdicts (BUY, SELL, and AVOID) from every AI response
       const q = quotes[selected];
-      if (q && /FINAL VERDICT:\s*(BUY|SELL)/i.test(reply)) {
-        const model = scoreSetup(q);
-        const verdict    = reply.match(/FINAL VERDICT:\s*(BUY|SELL)/i)?.[1]?.toUpperCase();
-        const stopMatch  = reply.match(/Stop:\s*\$?([\d.]+)/i);
-        const tgtMatch   = reply.match(/Target:\s*\$?([\d.]+)/i);
-        const rrMatch    = reply.match(/R\/R:\s*([\d.]+)/i);
-        const confMatch  = reply.match(/Confidence:\s*(HIGH|MEDIUM|LOW)/i);
-        logDecision({
-          symbol: selected, entryPrice: q.price, verdict,
-          stop:   stopMatch  ? parseFloat(stopMatch[1])  : null,
-          target: tgtMatch   ? parseFloat(tgtMatch[1])   : null,
-          rr:     rrMatch    ? parseFloat(rrMatch[1])    : null,
-          confidence: confMatch ? confMatch[1] : null,
-          modelScore: { direction: model.direction, confidence: model.confidence, treeSignal: model.treeSignal },
-        });
-        setDecisionLog(getLog());
+      if (q) {
+        const verdictMatch = reply.match(/FINAL VERDICT:\s*(BUY|SELL|AVOID)/i);
+        if (verdictMatch) {
+          const model = scoreSetup(q);
+          const verdict   = verdictMatch[1].toUpperCase();
+          const stopMatch = reply.match(/Stop:\s*\$?([\d.]+)/i);
+          const tgtMatch  = reply.match(/Target:\s*\$?([\d.]+)/i);
+          const rrMatch   = reply.match(/R\/R:\s*([\d.]+)/i);
+          const confMatch = reply.match(/Confidence:\s*(HIGH|MEDIUM|LOW)/i);
+          logDecision({
+            symbol: selected, entryPrice: q.price, verdict,
+            stop:   stopMatch ? parseFloat(stopMatch[1]) : null,
+            target: tgtMatch  ? parseFloat(tgtMatch[1])  : null,
+            rr:     rrMatch   ? parseFloat(rrMatch[1])   : null,
+            confidence: confMatch ? confMatch[1] : null,
+            modelScore: { direction: model.direction, confidence: model.confidence, treeSignal: model.treeSignal },
+            features: model.features,
+          });
+          setDecisionLog(getLog());
+        }
       }
     } catch(err) {
       setMessages(prev=>[...prev,{type:"bot",text:`⚠️ Connection failed: ${err.message}`}]);
@@ -418,6 +473,67 @@ export default function App() {
   function handleSend() {
     if (!input.trim()||thinking) return;
     const txt = input.trim(); setInput(""); sendToAI(txt);
+  }
+
+  async function sendBestOpportunity() {
+    if (thinking || Object.keys(quotes).length < 3) return;
+    setThinking(true);
+    setTab("chat");
+    const context = buildBestOpportunityContext(quotes, news);
+    setMessages(prev=>[...prev,{type:"user",text:"⚡ BEST OPPORTUNITY SCAN — rank all stocks and pick ONE trade now."}]);
+    const newHistory = [...chatHistory, { role:"user", content:context }];
+    setChatHistory(newHistory);
+    try {
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method:"POST",
+        headers:{
+          "Content-Type":"application/json",
+          "x-api-key":apiKey,
+          "anthropic-version":"2023-06-01",
+          "anthropic-dangerous-direct-browser-access":"true",
+        },
+        body: JSON.stringify({
+          model:"claude-opus-4-5",
+          max_tokens:4096,
+          system:SYSTEM_PROMPT,
+          messages:newHistory,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok||data.error) {
+        setMessages(prev=>[...prev,{type:"bot",text:`⚠️ API error: ${data.error?.message||`HTTP ${res.status}`}`}]);
+        setThinking(false); return;
+      }
+      const reply = data.content?.filter(b=>b.type==="text").map(b=>b.text).join("\n")||"No response.";
+      setChatHistory(prev=>[...prev,{role:"assistant",content:reply}]);
+      setMessages(prev=>[...prev,{type:"bot",text:reply}]);
+      // Detect which symbol was picked and log it
+      const symMatch = reply.match(/(?:FINAL VERDICT.*?|picking|chosen?|trade on|go with)\s+([A-Z]{2,6})/i);
+      const pickedSym = symMatch ? WATCHLIST.find(s => s === symMatch[1].toUpperCase()) : null;
+      const logSym = pickedSym || selected;
+      const q = quotes[logSym];
+      if (q) {
+        const verdictMatch = reply.match(/FINAL VERDICT:\s*(BUY|SELL|AVOID)/i);
+        if (verdictMatch) {
+          const model = scoreSetup(q);
+          logDecision({
+            symbol: logSym, entryPrice: q.price,
+            verdict:    verdictMatch[1].toUpperCase(),
+            stop:       parseFloat(reply.match(/Stop:\s*\$?([\d.]+)/i)?.[1]) || null,
+            target:     parseFloat(reply.match(/Target:\s*\$?([\d.]+)/i)?.[1]) || null,
+            rr:         parseFloat(reply.match(/R\/R:\s*([\d.]+)/i)?.[1]) || null,
+            confidence: reply.match(/Confidence:\s*(HIGH|MEDIUM|LOW)/i)?.[1] || null,
+            modelScore: { direction:model.direction, confidence:model.confidence, treeSignal:model.treeSignal },
+            features: model.features,
+          });
+          setDecisionLog(getLog());
+          if (pickedSym) setSelected(pickedSym);
+        }
+      }
+    } catch(err) {
+      setMessages(prev=>[...prev,{type:"bot",text:`⚠️ Connection failed: ${err.message}`}]);
+    }
+    setThinking(false);
   }
 
   const selQ = quotes[selected];
@@ -443,6 +559,13 @@ export default function App() {
           <span style={{fontSize:9,color:"#555",letterSpacing:1}}>
             {lastRefresh?`${loadedCount}/${WATCHLIST.length} · ${new Date(lastRefresh).toLocaleTimeString()}`:"CONNECTING..."}
           </span>
+          <button onClick={sendBestOpportunity} disabled={thinking||loadedCount<3}
+            style={{background:thinking||loadedCount<3?"#1A1500":"#C9A84C",
+              color:thinking||loadedCount<3?"#555":"#000",border:"none",fontFamily:"'Courier New',monospace",
+              fontWeight:900,fontSize:9,letterSpacing:1,padding:"4px 10px",
+              cursor:thinking||loadedCount<3?"not-allowed":"pointer"}}>
+            ★ BEST TRADE
+          </button>
           <button onClick={()=>refreshAll()} style={{background:"#1A1A1A",border:"1px solid #2A2A2A",
             color:"#888",fontSize:9,padding:"3px 8px",cursor:"pointer",letterSpacing:1,fontFamily:"inherit"}}>
             ↻ REFRESH
@@ -617,57 +740,96 @@ export default function App() {
 
           {tab==="log"&&(()=>{
             const stats = getPerformanceStats();
+            const reviewed = decisionLog.filter(d=>d.reviewed && d.features);
+            const wts = getCurrentWeights();
+            const FEATURE_NAMES = ["RSI","MACD","Mom","BB","EMA9/20","EMA20/50","Vol"];
             return (
               <div style={{flex:1,overflowY:"auto",padding:14}}>
-                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
-                  <div style={{color:"#C9A84C",fontSize:11,letterSpacing:2}}>DECISION LOG — {decisionLog.length} trades</div>
-                  {stats&&<div style={{fontSize:10,color:"#888"}}>
-                    Win rate: <span style={{color:stats.winRate>50?"#2ECC71":"#E74C3C",fontWeight:700}}>{stats.winRate}%</span>
-                    &nbsp;·&nbsp;Avg P&L: <span style={{color:stats.avgPnl>0?"#2ECC71":"#E74C3C",fontWeight:700}}>{stats.avgPnl>0?"+":""}{stats.avgPnl}%</span>
-                    &nbsp;·&nbsp;{stats.wins}W / {stats.losses}L
-                  </div>}
+                {/* Header row */}
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10,flexWrap:"wrap",gap:8}}>
+                  <div style={{color:"#C9A84C",fontSize:11,letterSpacing:2}}>DECISION LOG — {decisionLog.length} entries</div>
+                  <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                    {stats&&<div style={{fontSize:10,color:"#888"}}>
+                      Win: <span style={{color:stats.winRate>50?"#2ECC71":"#E74C3C",fontWeight:700}}>{stats.winRate}%</span>
+                      &nbsp;·&nbsp;<span style={{color:stats.avgPnl>0?"#2ECC71":"#E74C3C",fontWeight:700}}>{stats.avgPnl>0?"+":""}{stats.avgPnl}%</span>
+                      &nbsp;·&nbsp;{stats.wins}W/{stats.losses}L
+                    </div>}
+                    <button
+                      disabled={reviewed.length < 2}
+                      onClick={()=>{
+                        const res = adaptWeights(decisionLog.filter(d=>d.reviewed));
+                        alert(`Model updated from ${res.trained} reviewed trades.\nWeights adapted via gradient descent (${40} epochs).`);
+                      }}
+                      style={{background:reviewed.length>=2?"#0A1A2A":"#111",
+                        border:`1px solid ${reviewed.length>=2?"#2A6A9A":"#2A2A2A"}`,
+                        color:reviewed.length>=2?"#5AACDF":"#444",
+                        fontSize:9,padding:"4px 10px",cursor:reviewed.length>=2?"pointer":"not-allowed",
+                        fontFamily:"inherit",letterSpacing:1}}>
+                      🧠 LEARN ({reviewed.length} trades)
+                    </button>
+                    <button
+                      onClick={()=>{resetWeights();alert("Model weights reset to defaults.");}}
+                      style={{background:"#111",border:"1px solid #2A2A2A",color:"#444",
+                        fontSize:9,padding:"4px 8px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
+                      RESET MODEL
+                    </button>
+                  </div>
                 </div>
+
+                {/* Current weights display */}
+                <div style={{background:"#0A0A0A",border:"1px solid #1A1A1A",padding:"8px 10px",marginBottom:12,fontSize:9,color:"#444"}}>
+                  <span style={{color:"#555",letterSpacing:1}}>LR WEIGHTS: </span>
+                  {FEATURE_NAMES.map((n,i)=>(
+                    <span key={n} style={{marginRight:10,color:wts.weights[i]>0?"#2ECC71":"#E74C3C"}}>
+                      {n}:{wts.weights[i]?.toFixed(2)}
+                    </span>
+                  ))}
+                </div>
+
                 {decisionLog.length===0&&<div style={{color:"#333",fontSize:11,lineHeight:1.7}}>
-                  No decisions logged yet.<br/>Run an analysis — if the AI says BUY or SELL it gets logged here automatically.
+                  No decisions logged yet. Every AI verdict (BUY, SELL, or AVOID) is now logged automatically.
                 </div>}
+
                 {decisionLog.map(d=>{
                   const q = quotes[d.symbol];
                   const currentPrice = q?.price;
-                  const livePnl = currentPrice && !d.reviewed ? (d.verdict==="BUY"
+                  const isAvoid = d.verdict === "AVOID";
+                  const livePnl = currentPrice && !d.reviewed && !isAvoid ? (d.verdict==="BUY"
                     ? ((currentPrice-d.entryPrice)/d.entryPrice*100)
                     : ((d.entryPrice-currentPrice)/d.entryPrice*100)
                   ).toFixed(2) : null;
                   const pnl = d.reviewed ? d.pnlPct : livePnl;
-                  const verdictColor = d.verdict==="BUY"?"#2ECC71":"#E74C3C";
+                  const verdictColor = d.verdict==="BUY"?"#2ECC71":d.verdict==="SELL"?"#E74C3C":"#666";
                   const outcomeColor = d.outcome==="WIN"?"#2ECC71":d.outcome==="LOSS"?"#E74C3C":"#C9A84C";
                   return (
                     <div key={d.id} style={{background:"#0C0C0C",border:"1px solid #1A1A1A",
-                      borderLeft:`3px solid ${verdictColor}`,padding:12,marginBottom:8}}>
+                      borderLeft:`3px solid ${verdictColor}`,padding:10,marginBottom:6,
+                      opacity:isAvoid?0.6:1}}>
                       <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
                         <div>
-                          <span style={{fontWeight:900,color:"#FFF",fontSize:14,letterSpacing:1}}>{d.symbol}</span>
-                          <span style={{marginLeft:10,fontWeight:900,color:verdictColor,fontSize:13}}>{d.verdict}</span>
-                          {d.confidence&&<span style={{marginLeft:8,fontSize:9,color:"#555",letterSpacing:1}}>CONF: {d.confidence}</span>}
+                          <span style={{fontWeight:900,color:"#FFF",fontSize:13,letterSpacing:1}}>{d.symbol}</span>
+                          <span style={{marginLeft:8,fontWeight:900,color:verdictColor,fontSize:12}}>{d.verdict}</span>
+                          {d.confidence&&<span style={{marginLeft:6,fontSize:9,color:"#555",letterSpacing:1}}>{d.confidence}</span>}
                         </div>
-                        <span style={{fontSize:9,color:"#444"}}>{new Date(d.timestamp).toLocaleString()}</span>
+                        <span style={{fontSize:9,color:"#333"}}>{new Date(d.timestamp).toLocaleString()}</span>
                       </div>
-                      <div style={{display:"flex",gap:14,marginTop:8,fontSize:10,color:"#888",flexWrap:"wrap"}}>
-                        <span>Entry: <b style={{color:"#FFF"}}>${d.entryPrice?.toFixed(2)}</b></span>
-                        {d.stop&&<span>Stop: <b style={{color:"#E74C3C"}}>${d.stop}</b></span>}
-                        {d.target&&<span>Target: <b style={{color:"#2ECC71"}}>${d.target}</b></span>}
-                        {d.rr&&<span>R/R: <b style={{color:"#C9A84C"}}>{d.rr}:1</b></span>}
-                        {currentPrice&&!d.reviewed&&<span>Now: <b style={{color:"#FFF"}}>${currentPrice?.toFixed(2)}</b></span>}
-                        {pnl!=null&&<span>P&L: <b style={{color:pnl>0?"#2ECC71":"#E74C3C"}}>{pnl>0?"+":""}{pnl}%</b></span>}
+                      <div style={{display:"flex",gap:12,marginTop:6,fontSize:10,color:"#888",flexWrap:"wrap"}}>
+                        <span>@ <b style={{color:"#FFF"}}>${d.entryPrice?.toFixed(2)}</b></span>
+                        {d.stop&&<span>SL:<b style={{color:"#E74C3C"}}>${d.stop}</b></span>}
+                        {d.target&&<span>TP:<b style={{color:"#2ECC71"}}>${d.target}</b></span>}
+                        {d.rr&&<span>R/R:<b style={{color:"#C9A84C"}}>{d.rr}:1</b></span>}
+                        {currentPrice&&!d.reviewed&&!isAvoid&&<span>Now:<b style={{color:"#FFF"}}>${currentPrice?.toFixed(2)}</b></span>}
+                        {pnl!=null&&<span>P&L:<b style={{color:pnl>0?"#2ECC71":"#E74C3C"}}>{pnl>0?"+":""}{pnl}%</b></span>}
                         {d.reviewed&&<span style={{color:outcomeColor,fontWeight:900}}>{d.outcome}</span>}
                       </div>
-                      <div style={{fontSize:9,color:"#333",marginTop:6}}>
-                        Model: {d.modelScore?.direction} · Tree: {d.modelScore?.treeSignal} · Confidence: {d.modelScore?.confidence}%
+                      <div style={{fontSize:8,color:"#2A2A2A",marginTop:4}}>
+                        {d.modelScore?.direction} · {d.modelScore?.treeSignal} · {d.modelScore?.confidence}%
                       </div>
-                      {!d.reviewed&&currentPrice&&(
+                      {!d.reviewed&&!isAvoid&&currentPrice&&(
                         <button onClick={()=>setDecisionLog(reviewDecision(d.id, currentPrice))}
-                          style={{marginTop:8,background:"#1A1500",border:"1px solid #C9A84C",color:"#C9A84C",
-                            fontSize:9,padding:"4px 10px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
-                          ✓ REVIEW NOW (at ${currentPrice?.toFixed(2)})
+                          style={{marginTop:6,background:"#1A1500",border:"1px solid #C9A84C",color:"#C9A84C",
+                            fontSize:9,padding:"3px 8px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
+                          ✓ REVIEW (${currentPrice?.toFixed(2)})
                         </button>
                       )}
                     </div>
@@ -676,7 +838,7 @@ export default function App() {
                 {decisionLog.length>0&&(
                   <button onClick={()=>{localStorage.removeItem("trader_decision_log");setDecisionLog([]);}}
                     style={{marginTop:8,background:"#1A0808",border:"1px solid #4A1A1A",color:"#E74C3C",
-                      fontSize:9,padding:"5px 12px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
+                      fontSize:9,padding:"4px 10px",cursor:"pointer",fontFamily:"inherit",letterSpacing:1}}>
                     CLEAR LOG
                   </button>
                 )}
@@ -736,26 +898,34 @@ export default function App() {
 
           {tab==="news"&&(
             <div style={{flex:1,overflowY:"auto",padding:14}}>
-              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
-                <div style={{color:"#C9A84C",fontSize:11,letterSpacing:2}}>AL JAZEERA — GEOPOLITICAL CONTEXT</div>
-                <button onClick={()=>{setNewsLoading(true);fetchAlJazeeraNews().then(a=>setNews(a)).finally(()=>setNewsLoading(false));}}
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8}}>
+                <div>
+                  <div style={{color:"#C9A84C",fontSize:11,letterSpacing:2}}>LIVE NEWS FEED</div>
+                  <div style={{fontSize:9,color:"#444",marginTop:2}}>Al Jazeera · Reuters · MarketWatch · CNBC · BBC · Yahoo Finance — {news.length} articles</div>
+                </div>
+                <button onClick={()=>{setNewsLoading(true);fetchAllNews().then(a=>setNews(a)).finally(()=>setNewsLoading(false));}}
                   style={{background:"#1A1A1A",border:"1px solid #2A2A2A",color:"#888",fontSize:9,
                     padding:"3px 8px",cursor:"pointer",letterSpacing:1,fontFamily:"inherit"}}>
                   ↻ REFRESH
                 </button>
               </div>
-              {newsLoading&&<div style={{color:"#555",fontSize:10,letterSpacing:1}}>FETCHING NEWS...</div>}
+              {newsLoading&&<div style={{color:"#555",fontSize:10,letterSpacing:1,padding:"20px 0"}}>FETCHING FROM 9 SOURCES...</div>}
               {!newsLoading&&news.length===0&&(
                 <div style={{color:"#333",fontSize:11,lineHeight:1.7}}>
-                  No articles loaded. Al Jazeera RSS may be blocked by the proxy.<br/>
-                  Try clicking REFRESH or check your network.
+                  No articles loaded. RSS proxies may be blocked.<br/>Click REFRESH to retry.
                 </div>
               )}
               {news.map((n,i)=>(
-                <div key={i} style={{padding:"10px 0",borderBottom:"1px solid #111"}}>
-                  <div style={{fontSize:11,color:"#D8D0C0",lineHeight:1.5,marginBottom:4}}>{n.title}</div>
-                  <div style={{fontSize:9,color:"#444",marginBottom:4}}>{n.date.toLocaleDateString()} {n.date.toLocaleTimeString()}</div>
-                  {n.desc&&<div style={{fontSize:10,color:"#555",lineHeight:1.5}}>{n.desc}</div>}
+                <div key={i} style={{padding:"8px 0",borderBottom:"1px solid #0F0F0F",display:"flex",gap:10}}>
+                  <div style={{flexShrink:0,width:72,paddingTop:2}}>
+                    <div style={{fontSize:8,color:"#C9A84C",letterSpacing:1,fontWeight:700,textTransform:"uppercase",
+                      overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{n.source||"News"}</div>
+                    <div style={{fontSize:8,color:"#333",marginTop:2}}>{n.date.toLocaleDateString()}</div>
+                  </div>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:11,color:"#D8D0C0",lineHeight:1.5,marginBottom:2}}>{n.title}</div>
+                    {n.desc&&<div style={{fontSize:9,color:"#444",lineHeight:1.4}}>{n.desc}</div>}
+                  </div>
                 </div>
               ))}
             </div>

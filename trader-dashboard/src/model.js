@@ -1,8 +1,60 @@
 // ─── Pre-trained logistic regression ────────────────────────────────────────
 // Features: [rsi_centered, macd_sign, momentum_norm, bb_centered, ema_short, ema_med, vol_norm]
 // Weights derived from backtesting across 12 historical crisis/volatility regimes
-const LR_WEIGHTS = [-0.52, 1.28, 1.61, -0.74, 0.91, 1.05, 0.22];
-const LR_BIAS = 0.04;
+const DEFAULT_WEIGHTS = [-0.52, 1.28, 1.61, -0.74, 0.91, 1.05, 0.22];
+const DEFAULT_BIAS = 0.04;
+const WEIGHTS_KEY = "trader_lr_weights";
+
+function loadWeights() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(WEIGHTS_KEY) || "null");
+    if (saved?.weights?.length === 7) return { weights: saved.weights, bias: saved.bias };
+  } catch {}
+  return { weights: [...DEFAULT_WEIGHTS], bias: DEFAULT_BIAS };
+}
+
+function saveWeights(weights, bias) {
+  localStorage.setItem(WEIGHTS_KEY, JSON.stringify({ weights, bias, updatedAt: new Date().toISOString() }));
+}
+
+// Gradient descent update: minimise binary cross-entropy on reviewed trades
+// lr = learning rate, epochs = passes over the data
+export function adaptWeights(reviewedLog, lr = 0.08, epochs = 40) {
+  const { weights, bias } = loadWeights();
+  const w = [...weights];
+  let b = bias;
+
+  // Build training samples from reviewed decisions
+  const samples = reviewedLog
+    .filter(d => d.reviewed && d.outcome && d.features)
+    .map(d => ({
+      x: d.features,
+      y: (d.verdict === "BUY" && d.outcome === "WIN") || (d.verdict === "SELL" && d.outcome === "WIN") ? 1 : 0,
+    }));
+
+  if (samples.length < 2) return { weights: w, bias: b, trained: 0 };
+
+  for (let e = 0; e < epochs; e++) {
+    for (const { x, y } of samples) {
+      const dot = x.reduce((s, v, i) => s + v * w[i], b);
+      const pred = 1 / (1 + Math.exp(-dot));
+      const err = pred - y;
+      for (let i = 0; i < w.length; i++) w[i] -= lr * err * x[i];
+      b -= lr * err;
+    }
+  }
+
+  saveWeights(w, b);
+  return { weights: w, bias: b, trained: samples.length };
+}
+
+export function resetWeights() {
+  localStorage.removeItem(WEIGHTS_KEY);
+}
+
+export function getCurrentWeights() {
+  return loadWeights();
+}
 
 function sigmoid(x) { return 1 / (1 + Math.exp(-x)); }
 
@@ -19,11 +71,13 @@ function extractFeatures(q) {
 
 function logisticScore(q) {
   const f = extractFeatures(q);
-  const dot = f.reduce((sum, v, i) => sum + v * LR_WEIGHTS[i], LR_BIAS);
+  const { weights, bias } = loadWeights();
+  const dot = f.reduce((sum, v, i) => sum + v * weights[i], bias);
   return sigmoid(dot); // P(bullish)
 }
 
-// ─── Decision tree (pre-trained on crisis regimes) ───────────────────────────
+// ─── Decision tree — FORCED DECISIVE MODE ────────────────────────────────────
+// Only returns AVOID in genuine crisis conditions. Every other state returns BUY or SELL.
 function decisionTree(q) {
   const rsi = q.rsi ?? 50;
   const macd_bull = q.macd != null && q.macd > 0;
@@ -33,28 +87,31 @@ function decisionTree(q) {
   const vol = q.volRatio ?? 1;
   const bb = q.bb?.pos ?? 0.5;
 
-  // Node 1: Bear regime check
+  // ═ CRISIS-ONLY AVOID — only when genuinely dangerous ═
+  // Extreme ATR (crash vol) + falling prices
+  const atrPct = q.atr && q.price ? (q.atr / q.price) * 100 : 0;
+  if (atrPct > 4 && mom < -5 && vol > 3) {
+    return { signal: "AVOID", reason: "Crisis-level volatility — ATR >4% price + momentum <-5% + volume >3x. Stand aside until dust settles." };
+  }
+
+  // ═ BEAR REGIME (EMA20 < EMA50) ═ — bias short
   if (!ema_m_bull) {
-    // Bear regime
-    if (rsi < 25 && vol > 1.5) return { signal: "STRONG_BUY", reason: "Capitulation — extreme oversold + volume spike in bear regime" };
-    if (rsi < 30) return { signal: "BUY", reason: "Oversold bounce opportunity in bear regime — short trade only" };
-    if (rsi > 65 && !macd_bull) return { signal: "STRONG_SELL", reason: "Bear regime rally failure — sell into strength" };
-    if (mom < -1.5 && vol > 1.3) return { signal: "SELL", reason: "Bear regime momentum confirmed by volume" };
-    return { signal: "AVOID", reason: "Bear regime — no high-probability setup" };
+    if (rsi < 25 && vol > 1.5) return { signal: "BUY", reason: "Capitulation bounce setup — extreme oversold + volume spike. Counter-trend long only, tight stop." };
+    if (rsi < 32) return { signal: "BUY", reason: "Oversold bounce in bear regime — quick long scalp opportunity, exit on any strength." };
+    if (rsi > 60) return { signal: "SELL", reason: "Bear regime rally — shorting resistance is high-probability." };
+    if (mom < -1) return { signal: "SELL", reason: "Bear regime + negative momentum = trend continuation short." };
+    if (ema_s_bull && vol > 1.2) return { signal: "BUY", reason: "Short-term reversal forming inside bear regime — tactical long." };
+    return { signal: "SELL", reason: "Bear regime default — trend-following bias." };
   }
 
-  // Node 2: Bull regime
-  if (ema_m_bull) {
-    if (rsi > 75 && bb > 0.9 && vol < 0.8) return { signal: "SELL", reason: "Bull regime exhaustion — overbought, low vol, BB extreme" };
-    if (rsi > 70 && mom > 2) return { signal: "AVOID", reason: "Extended >2 ATR — Livermore rule: never chase" };
-    if (rsi < 35 && ema_s_bull && macd_bull) return { signal: "STRONG_BUY", reason: "Bull regime pullback into support — all indicators align" };
-    if (rsi < 45 && ema_s_bull && vol > 1.2) return { signal: "BUY", reason: "Bull regime dip with volume confirmation" };
-    if (!ema_s_bull && !macd_bull && mom < -1) return { signal: "SELL", reason: "Short-term breakdown in bull regime — countertrend" };
-    if (ema_s_bull && macd_bull && vol > 1) return { signal: "BUY", reason: "Bull regime continuation — trend + momentum + volume aligned" };
-    return { signal: "HOLD", reason: "Bull regime but no clear entry — wait for pullback or breakout" };
-  }
-
-  return { signal: "AVOID", reason: "Insufficient data" };
+  // ═ BULL REGIME (EMA20 > EMA50) ═ — bias long
+  if (rsi > 78 && mom > 3 && bb > 0.95) return { signal: "SELL", reason: "Bull regime blowoff — extremely overbought + stretched BB. Short-term short/profit-take." };
+  if (rsi > 72 && !macd_bull) return { signal: "SELL", reason: "Bull regime exhaustion — high RSI + MACD rolling over. Tactical short." };
+  if (rsi < 35 && ema_s_bull) return { signal: "BUY", reason: "Bull regime pullback into support — classic buy-the-dip. High conviction long." };
+  if (rsi < 45 && vol > 1.2) return { signal: "BUY", reason: "Bull regime dip with volume confirmation — accumulation zone." };
+  if (!ema_s_bull && !macd_bull && mom < -1.5) return { signal: "SELL", reason: "Short-term breakdown in bull regime — tactical counter-trend short, tight stop above prior high." };
+  if (ema_s_bull && macd_bull) return { signal: "BUY", reason: "Bull regime trend continuation — EMAs + MACD aligned. Stay with the trend." };
+  return { signal: "BUY", reason: "Bull regime default — long bias unless proven otherwise." };
 }
 
 // ─── Historical crisis fingerprints ─────────────────────────────────────────
@@ -96,6 +153,7 @@ function findClosestCrisis(q) {
 
 // ─── Main scoring function ───────────────────────────────────────────────────
 export function scoreSetup(q) {
+  const features  = extractFeatures(q);
   const lrProb   = logisticScore(q);          // P(bullish) from LR
   const tree     = decisionTree(q);           // Decision tree signal
   const crisis   = findClosestCrisis(q);      // Nearest historical analogue
@@ -112,6 +170,7 @@ export function scoreSetup(q) {
   const tgt3Short = price > 0 && atr > 0 ? (price - 4.5 * atr).toFixed(2) : null;
 
   return {
+    features,
     lrProb: (lrProb * 100).toFixed(1),
     direction,
     confidence,
@@ -125,22 +184,22 @@ export function scoreSetup(q) {
 // ─── Decision log (localStorage) ────────────────────────────────────────────
 const LOG_KEY = "trader_decision_log";
 
-export function logDecision({ symbol, entryPrice, verdict, stop, target, rr, confidence, modelScore }) {
-  if (!["BUY","SELL"].includes(verdict)) return; // only log actionable decisions
+export function logDecision({ symbol, entryPrice, verdict, stop, target, rr, confidence, modelScore, features }) {
   const log = getLog();
   log.unshift({
     id: Date.now(),
     timestamp: new Date().toISOString(),
     symbol,
     entryPrice,
-    verdict,       // "BUY" or "SELL"
-    stop,          // stop loss level
-    target,        // profit target
-    rr,            // reward/risk ratio
+    verdict,       // "BUY" | "SELL" | "AVOID"
+    stop,
+    target,
+    rr,
     confidence,
     modelScore,
+    features,      // raw feature vector for adaptive learning
     reviewed: false,
-    outcome: null, // "WIN" | "LOSS" | "OPEN"
+    outcome: null, // "WIN" | "LOSS"
     reviewPrice: null,
     pnlPct: null,
   });
