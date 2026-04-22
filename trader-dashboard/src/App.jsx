@@ -378,6 +378,7 @@ export default function App() {
   const [apiKey, setApiKey] = useState(()=>localStorage.getItem("anthropic_key")||"");
   const [finnhubKey, setFinnhubKey] = useState(()=>localStorage.getItem("finnhub_key")||"");
   const [decisionLog, setDecisionLog] = useState(()=>getLog());
+  const [loggedMsgIds, setLoggedMsgIds] = useState(new Set());
   const [news, setNews] = useState([]);
   const [newsLoading, setNewsLoading] = useState(false);
   const chatRef = useRef(null);
@@ -440,30 +441,25 @@ export default function App() {
       }
       const reply = data.content?.filter(b=>b.type==="text").map(b=>b.text).join("\n")||"No response.";
       setChatHistory(prev=>[...prev,{role:"assistant",content:reply}]);
-      setMessages(prev=>[...prev,{type:"bot",text:reply}]);
-      // Log ALL verdicts (BUY, SELL, and AVOID) from every AI response
+      // Parse any trade verdict from the reply and attach to message so user can manually log
       const q = quotes[selected];
-      if (q) {
-        const verdictMatch = reply.match(/FINAL VERDICT:\s*(BUY|SELL|AVOID)/i);
-        if (verdictMatch) {
-          const model = scoreSetup(q);
-          const verdict   = verdictMatch[1].toUpperCase();
-          const stopMatch = reply.match(/Stop:\s*\$?([\d.]+)/i);
-          const tgtMatch  = reply.match(/Target:\s*\$?([\d.]+)/i);
-          const rrMatch   = reply.match(/R\/R:\s*([\d.]+)/i);
-          const confMatch = reply.match(/Confidence:\s*(HIGH|MEDIUM|LOW)/i);
-          logDecision({
-            symbol: selected, entryPrice: q.price, verdict,
-            stop:   stopMatch ? parseFloat(stopMatch[1]) : null,
-            target: tgtMatch  ? parseFloat(tgtMatch[1])  : null,
-            rr:     rrMatch   ? parseFloat(rrMatch[1])   : null,
-            confidence: confMatch ? confMatch[1] : null,
-            modelScore: { direction: model.direction, confidence: model.confidence, treeSignal: model.treeSignal },
-            features: model.features,
-          });
-          setDecisionLog(getLog());
-        }
+      const verdictMatch = reply.match(/FINAL VERDICT:\s*(BUY|SELL|AVOID)/i);
+      let tradeData = null;
+      if (q && verdictMatch) {
+        const model = scoreSetup(q);
+        tradeData = {
+          symbol: selected, entryPrice: q.price,
+          verdict:    verdictMatch[1].toUpperCase(),
+          stop:       parseFloat(reply.match(/Stop:\s*\$?([\d.]+)/i)?.[1]) || null,
+          target:     parseFloat(reply.match(/Target:\s*\$?([\d.]+)/i)?.[1]) || null,
+          rr:         parseFloat(reply.match(/R\/R:\s*([\d.]+)/i)?.[1]) || null,
+          confidence: reply.match(/Confidence:\s*(HIGH|MEDIUM|LOW)/i)?.[1] || null,
+          modelScore: { direction: model.direction, confidence: model.confidence, treeSignal: model.treeSignal },
+          features: model.features,
+        };
       }
+      const msgId = Date.now();
+      setMessages(prev=>[...prev,{id: msgId, type:"bot", text:reply, tradeData}]);
     } catch(err) {
       setMessages(prev=>[...prev,{type:"bot",text:`⚠️ Connection failed: ${err.message}`}]);
     }
@@ -512,24 +508,24 @@ export default function App() {
       const pickedSym = symMatch ? WATCHLIST.find(s => s === symMatch[1].toUpperCase()) : null;
       const logSym = pickedSym || selected;
       const q = quotes[logSym];
-      if (q) {
-        const verdictMatch = reply.match(/FINAL VERDICT:\s*(BUY|SELL|AVOID)/i);
-        if (verdictMatch) {
-          const model = scoreSetup(q);
-          logDecision({
-            symbol: logSym, entryPrice: q.price,
-            verdict:    verdictMatch[1].toUpperCase(),
-            stop:       parseFloat(reply.match(/Stop:\s*\$?([\d.]+)/i)?.[1]) || null,
-            target:     parseFloat(reply.match(/Target:\s*\$?([\d.]+)/i)?.[1]) || null,
-            rr:         parseFloat(reply.match(/R\/R:\s*([\d.]+)/i)?.[1]) || null,
-            confidence: reply.match(/Confidence:\s*(HIGH|MEDIUM|LOW)/i)?.[1] || null,
-            modelScore: { direction:model.direction, confidence:model.confidence, treeSignal:model.treeSignal },
-            features: model.features,
-          });
-          setDecisionLog(getLog());
-          if (pickedSym) setSelected(pickedSym);
-        }
+      const verdictMatch = reply.match(/FINAL VERDICT:\s*(BUY|SELL|AVOID)/i);
+      let tradeData = null;
+      if (q && verdictMatch) {
+        const model = scoreSetup(q);
+        tradeData = {
+          symbol: logSym, entryPrice: q.price,
+          verdict:    verdictMatch[1].toUpperCase(),
+          stop:       parseFloat(reply.match(/Stop:\s*\$?([\d.]+)/i)?.[1]) || null,
+          target:     parseFloat(reply.match(/Target:\s*\$?([\d.]+)/i)?.[1]) || null,
+          rr:         parseFloat(reply.match(/R\/R:\s*([\d.]+)/i)?.[1]) || null,
+          confidence: reply.match(/Confidence:\s*(HIGH|MEDIUM|LOW)/i)?.[1] || null,
+          modelScore: { direction:model.direction, confidence:model.confidence, treeSignal:model.treeSignal },
+          features: model.features,
+        };
+        if (pickedSym) setSelected(pickedSym);
       }
+      const msgId = Date.now();
+      setMessages(prev=>[...prev,{id: msgId, type:"bot", text:reply, tradeData}]);
     } catch(err) {
       setMessages(prev=>[...prev,{type:"bot",text:`⚠️ Connection failed: ${err.message}`}]);
     }
@@ -952,24 +948,56 @@ export default function App() {
                     </div>
                   </div>
                 )}
-                {messages.map((m,i)=>(
-                  <div key={i} style={{display:"flex",gap:10,alignSelf:m.type==="user"?"flex-end":"flex-start",
-                    maxWidth:"95%",flexDirection:m.type==="user"?"row-reverse":"row"}}>
-                    <div style={{width:28,height:28,flexShrink:0,alignSelf:"flex-start",
-                      background:m.type==="user"?"#0d1117":"#1A1500",
-                      border:`1px solid ${m.type==="user"?"#222":"#C9A84C"}`,
-                      display:"flex",alignItems:"center",justifyContent:"center",fontSize:13}}>
-                      {m.type==="user"?"👤":"📈"}
+                {messages.map((m,i)=>{
+                  const td = m.tradeData;
+                  const isLogged = m.id && loggedMsgIds.has(m.id);
+                  const vColor = td?.verdict==="BUY"?"#2ECC71":td?.verdict==="SELL"?"#E74C3C":"#888";
+                  return (
+                    <div key={i} style={{display:"flex",gap:10,alignSelf:m.type==="user"?"flex-end":"flex-start",
+                      maxWidth:"95%",flexDirection:m.type==="user"?"row-reverse":"row"}}>
+                      <div style={{width:28,height:28,flexShrink:0,alignSelf:"flex-start",
+                        background:m.type==="user"?"#0d1117":"#1A1500",
+                        border:`1px solid ${m.type==="user"?"#222":"#C9A84C"}`,
+                        display:"flex",alignItems:"center",justifyContent:"center",fontSize:13}}>
+                        {m.type==="user"?"👤":"📈"}
+                      </div>
+                      <div style={{display:"flex",flexDirection:"column",gap:6,flex:1,minWidth:0}}>
+                        <div style={{background:m.type==="user"?"#0d1117":"#111",border:"1px solid #1E1E1E",
+                          borderLeft:m.type==="bot"?"3px solid #C9A84C":"1px solid #1E1E1E",
+                          borderRight:m.type==="user"?"3px solid #333":"1px solid #1E1E1E",
+                          padding:"10px 14px",fontSize:12,lineHeight:1.8,
+                          color:m.type==="user"?"#888":"#D8D0C0",whiteSpace:"pre-wrap"}}>
+                          {m.text}
+                        </div>
+                        {td && !isLogged && (
+                          <div style={{display:"flex",alignItems:"center",gap:10,padding:"6px 10px",
+                            background:"#0A0A0A",border:`1px solid ${vColor}33`,borderLeft:`3px solid ${vColor}`}}>
+                            <span style={{fontSize:10,color:vColor,fontWeight:900,letterSpacing:1}}>{td.symbol} {td.verdict}</span>
+                            <span style={{fontSize:9,color:"#555"}}>@ ${td.entryPrice?.toFixed(2)}</span>
+                            {td.stop&&<span style={{fontSize:9,color:"#666"}}>SL ${td.stop}</span>}
+                            {td.target&&<span style={{fontSize:9,color:"#666"}}>TP ${td.target}</span>}
+                            {td.rr&&<span style={{fontSize:9,color:"#C9A84C"}}>{td.rr}:1</span>}
+                            <button onClick={()=>{
+                              logDecision(td);
+                              setDecisionLog(getLog());
+                              setLoggedMsgIds(prev=>new Set([...prev, m.id]));
+                              setTab("log");
+                            }} style={{marginLeft:"auto",background:"#0A1A0A",border:`1px solid ${vColor}`,
+                              color:vColor,fontSize:9,padding:"3px 10px",cursor:"pointer",
+                              fontFamily:"inherit",letterSpacing:1,fontWeight:700}}>
+                              📋 LOG THIS TRADE
+                            </button>
+                          </div>
+                        )}
+                        {td && isLogged && (
+                          <div style={{fontSize:9,color:"#2ECC71",padding:"3px 10px",letterSpacing:1}}>
+                            ✓ Logged to decision log
+                          </div>
+                        )}
+                      </div>
                     </div>
-                    <div style={{background:m.type==="user"?"#0d1117":"#111",border:"1px solid #1E1E1E",
-                      borderLeft:m.type==="bot"?"3px solid #C9A84C":"1px solid #1E1E1E",
-                      borderRight:m.type==="user"?"3px solid #333":"1px solid #1E1E1E",
-                      padding:"10px 14px",fontSize:12,lineHeight:1.8,
-                      color:m.type==="user"?"#888":"#D8D0C0",whiteSpace:"pre-wrap"}}>
-                      {m.text}
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
                 {thinking&&(
                   <div style={{display:"flex",gap:10}}>
                     <div style={{width:28,height:28,background:"#1A1500",border:"1px solid #C9A84C",
